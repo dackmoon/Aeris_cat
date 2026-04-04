@@ -25,6 +25,8 @@ private:
     lv_obj_t *_scr   = nullptr;
     lv_obj_t *_eyeL  = nullptr;
     lv_obj_t *_eyeR  = nullptr;
+    lv_obj_t *_maskL = nullptr;    // Happy crescent mask (bg-colored)
+    lv_obj_t *_maskR = nullptr;
     lv_obj_t *_mouth = nullptr;
 
     struct EyeState { int16_t cx, cy, w, h, rot; };
@@ -43,6 +45,8 @@ private:
     int16_t  _lookDX = 0, _lookDY = 0;
     int16_t  _lookTgtDX = 0, _lookTgtDY = 0;
 
+    int16_t  _maskDY = 82;             // mask Y offset (82 = off-screen, 20 = crescent)
+
     uint32_t _touchHappyEnd = 0;
 
     void _placeEye(lv_obj_t *eye, const EyeState &st,
@@ -60,6 +64,8 @@ private:
     static void _lookAnimCb(void *var, int32_t v);
     static void _lookDoneCb(lv_anim_t *a);
     static void _mouthAnimCb(void *var, int32_t v);
+    static void _maskAnimCb(void *var, int32_t v);
+    static void _maskFadeDoneCb(lv_anim_t *a);
 };
 
 extern CatFace catFace;

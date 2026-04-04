@@ -63,7 +63,7 @@ static void LVGL_Loop(void *parameter) {
     lvgl_port_lock(0);
     lv_timer_handler();
     lvgl_port_unlock();
-    vTaskDelay(pdMS_TO_TICKS(10));
+    vTaskDelay(pdMS_TO_TICKS(5));
   }
   vTaskDelete(NULL);
 }
