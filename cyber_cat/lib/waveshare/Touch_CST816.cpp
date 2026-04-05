@@ -1,7 +1,7 @@
 #include "Touch_CST816.h"
 
 struct CST816_Touch touch_data = {0};
-uint8_t Touch_interrupts = 0;
+volatile uint8_t Touch_interrupts = 0;
 
 static bool I2C_Read_Touch(uint16_t Driver_addr, uint8_t Reg_addr, uint8_t *Reg_data, uint32_t Length)
 {
@@ -32,7 +32,7 @@ static bool I2C_Write_Touch(uint8_t Driver_addr, uint8_t Reg_addr, const uint8_t
   return true;
 }
 
-void ARDUINO_ISR_ATTR Touch_CST816_ISR(void) {
+void IRAM_ATTR Touch_CST816_ISR(void) {
   Touch_interrupts = true;
 }
 

@@ -10,26 +10,14 @@
 
 #define EYE_L_X  113
 #define EYE_R_X  247
-#define EYE_Y    155
+#define EYE_Y    135
 #define EYE_D    95
-
-#define MOUTH_X  CX
-#define MOUTH_Y  265
 
 // ==========================================================
 //  Colors
 // ==========================================================
-#define COL_BG    lv_color_hex(0x0a0a1a)
-#define COL_EYE   lv_color_hex(0xffffff)
-#define COL_MOUTH lv_color_hex(0xffffff)
-
-// ==========================================================
-//  Happy crescent: mask circle sits above eye to reveal ◡ arc
-// ==========================================================
-#define HAPPY_EYE_D    80
-#define MASK_DY_ON      20   // mask final position: 20px below eye center → ◠ crescent
-#define MASK_DY_OFF     82   // mask off-screen: below eye, no coverage
-#define MASK_PAD         2
+#define COL_BG  lv_color_hex(0x0a0a1a)
+#define COL_EYE lv_color_hex(0xffffff)
 
 // ==========================================================
 //  Animation timing (ms)
@@ -37,9 +25,55 @@
 #define EXPR_DUR          350
 #define BLINK_CLOSE_DUR   100
 #define BLINK_OPEN_DUR    120
+#define HAPPY_BLINK_CLOSE 350
+#define HAPPY_BLINK_OPEN  400
 #define LOOK_MOVE_DUR     250
 #define LOOK_HOLD_DUR    1000
-#define MOUTH_DUR         180
+
+// ==========================================================
+//  Talking — 4-stage squeeze/unsquash loop
+//
+//  Stage 0  Neutral → squeeze    100ms ease_out
+//  Stage 1  squeeze → unsquash   150ms ease_out
+//  Stage 2  unsquash → overshoot 100ms overshoot (approx. ease_in_out)
+//  Stage 3  overshoot → neutral  100ms linear
+//
+//  Each stage is a lerp from one EyeState to the next.
+//  Left and right eyes are mirror images (rot sign flipped).
+// ==========================================================
+struct TalkStage {
+    CatFace::EyeState toL;   // target left eye
+    CatFace::EyeState toR;   // target right eye (rot is already negated)
+    uint32_t          dur;   // ms
+    lv_anim_path_cb_t path;
+};
+
+// Neutral baseline for Talking (cx/cy are absolute; rot = 0, look ignored here)
+static const CatFace::EyeState TALK_BASE_L = {EYE_L_X, EYE_Y, EYE_D, EYE_D, 0};
+static const CatFace::EyeState TALK_BASE_R = {EYE_R_X, EYE_Y, EYE_D, EYE_D, 0};
+
+// Stage table — row order matches stage index 0-3
+// rot unit: 0.1 degrees (LVGL convention)
+static const TalkStage TALK_STAGES[4] = {
+    // Stage 0: squeeze — flatten & tilt inward, lift up
+    { {EYE_L_X, (int16_t)(EYE_Y - 10), 100, 60,  100},
+      {EYE_R_X, (int16_t)(EYE_Y - 10), 100, 60, -100},
+      100, lv_anim_path_ease_out },
+
+    // Stage 1: unsquash — expand back beyond neutral, settle down
+    { {EYE_L_X, (int16_t)(EYE_Y + 10), 95, 95,  50},
+      {EYE_R_X, (int16_t)(EYE_Y + 10), 95, 95, -50},
+      150, lv_anim_path_ease_out },
+
+    // Stage 2: overshoot — very slightly larger, fully upright
+    { {EYE_L_X, EYE_Y, 98, 98, 0},
+      {EYE_R_X, EYE_Y, 98, 98, 0},
+      100, lv_anim_path_ease_in_out },
+
+    // Stage 3: settle back to neutral
+    { TALK_BASE_L, TALK_BASE_R,
+      100, lv_anim_path_linear },
+};
 
 // ==========================================================
 CatFace catFace;
@@ -49,6 +83,8 @@ const char *catExprName(CatExpression e) {
         "Neutral", "Happy", "Sad", "Angry",
         "Sleepy", "Curious", "Talking"
     };
+    static_assert(sizeof(n) / sizeof(n[0]) == CAT_EXPR_COUNT,
+                  "catExprName: array out of sync with CAT_EXPR_COUNT");
     return e < CAT_EXPR_COUNT ? n[e] : "?";
 }
 
@@ -62,8 +98,8 @@ static int16_t mix16(int16_t a, int16_t b, int32_t t) {
 }
 
 CatFace::EyeState CatFace::_lerpState(const EyeState &a,
-                                        const EyeState &b,
-                                        int32_t t) {
+                                       const EyeState &b,
+                                       int32_t t) {
     return {
         mix16(a.cx, b.cx, t), mix16(a.cy, b.cy, t),
         mix16(a.w,  b.w,  t), mix16(a.h,  b.h,  t),
@@ -72,10 +108,10 @@ CatFace::EyeState CatFace::_lerpState(const EyeState &a,
 }
 
 // ==========================================================
-//  Place one eye at given state + optional look offset
+//  Place one eye
 // ==========================================================
 void CatFace::_placeEye(lv_obj_t *eye, const EyeState &st,
-                         int16_t dx, int16_t dy) {
+                        int16_t dx, int16_t dy) {
     int16_t w = st.w > 0 ? st.w : 1;
     int16_t h = st.h > 0 ? st.h : 1;
     lv_obj_set_size(eye, w, h);
@@ -86,7 +122,8 @@ void CatFace::_placeEye(lv_obj_t *eye, const EyeState &st,
 }
 
 // ==========================================================
-//  Central render — composites expression + blink + look
+//  Central render — expression morph + blink composite
+//  (look offset suppressed during talking so eyes stay centred)
 // ==========================================================
 void CatFace::_render() {
     _baseL = _lerpState(_fromL, _stL, _exprProgress);
@@ -96,38 +133,23 @@ void CatFace::_render() {
     EyeState rR = _baseR;
 
     if (_blinkFactor > 0) {
-        rL.h = mix16(rL.h, 6, _blinkFactor);
-        rR.h = mix16(rR.h, 6, _blinkFactor);
+        if (_cur == CAT_HAPPY) {
+            rL.h = mix16(rL.h, 4, _blinkFactor);
+            rR.h = mix16(rR.h, 4, _blinkFactor);
+        } else {
+            rL.h = mix16(rL.h, 6, _blinkFactor);
+            rR.h = mix16(rR.h, 6, _blinkFactor);
+        }
     }
 
-    _placeEye(_eyeL, rL, _lookDX, _lookDY);
-    _placeEye(_eyeR, rR, _lookDX, _lookDY);
-
-    // Slide happy crescent masks (track interpolated eye state, stay unrotated)
-    // Masks stay axis-aligned; MASK_PAD is large enough to cover rotated eye
-    if (_maskDY < MASK_DY_OFF) {
-        int16_t mw, mh, mr;
-
-        mw = _baseL.w + MASK_PAD;
-        mh = _baseL.h + MASK_PAD;
-        mr = (mw < mh ? mw : mh) / 2;
-        lv_obj_set_size(_maskL, mw, mh);
-        lv_obj_set_style_radius(_maskL, mr, 0);
-        lv_obj_set_pos(_maskL, _baseL.cx + _lookDX - mw / 2,
-                               _baseL.cy + _lookDY + _maskDY - mh / 2);
-
-        mw = _baseR.w + MASK_PAD;
-        mh = _baseR.h + MASK_PAD;
-        mr = (mw < mh ? mw : mh) / 2;
-        lv_obj_set_size(_maskR, mw, mh);
-        lv_obj_set_style_radius(_maskR, mr, 0);
-        lv_obj_set_pos(_maskR, _baseR.cx + _lookDX - mw / 2,
-                               _baseR.cy + _lookDY + _maskDY - mh / 2);
-    }
+    int16_t lx = (_cur == CAT_TALKING) ? 0 : _lookDX;
+    int16_t ly = (_cur == CAT_TALKING) ? 0 : _lookDY;
+    _placeEye(_eyeL, rL, lx, ly);
+    _placeEye(_eyeR, rR, lx, ly);
 }
 
 // ==========================================================
-//  Animation callbacks
+//  Expression morph callback
 // ==========================================================
 void CatFace::_exprAnimCb(void *var, int32_t v) {
     CatFace *self = (CatFace *)var;
@@ -135,23 +157,48 @@ void CatFace::_exprAnimCb(void *var, int32_t v) {
     self->_render();
 }
 
+// ==========================================================
+//  Blink callbacks
+// ==========================================================
 void CatFace::_blinkAnimCb(void *var, int32_t v) {
     CatFace *self = (CatFace *)var;
-    if (self->_cur == CAT_HAPPY || self->_cur == CAT_SLEEPY) return;
+    if (self->_cur == CAT_SLEEPY) return;
     self->_blinkFactor = v;
     self->_render();
 }
 
 void CatFace::_blinkDoneCb(lv_anim_t *a) {
     CatFace *self = (CatFace *)a->var;
+    if ((uintptr_t)lv_anim_get_user_data(a) != self->_animEpoch) return;
+    if (self->_cur == CAT_SLEEPY) return;
     self->_blinkFactor = 0;
     self->_render();
     self->_scheduleBlink();
 }
 
+void CatFace::_scheduleBlink() {
+    if (_cur == CAT_SLEEPY || _cur == CAT_TALKING) return;
+    bool happy = (_cur == CAT_HAPPY);
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, this);
+    lv_anim_set_user_data(&a, (void *)(uintptr_t)_animEpoch);
+    lv_anim_set_values(&a, 0, 1000);
+    lv_anim_set_duration(&a, happy ? HAPPY_BLINK_CLOSE : BLINK_CLOSE_DUR);
+    lv_anim_set_reverse_duration(&a, happy ? HAPPY_BLINK_OPEN : BLINK_OPEN_DUR);
+    lv_anim_set_delay(&a, happy ? rng(2500, 5000) : rng(4000, 10000));
+    lv_anim_set_path_cb(&a, happy ? lv_anim_path_ease_in_out : lv_anim_path_ease_out);
+    lv_anim_set_exec_cb(&a, _blinkAnimCb);
+    lv_anim_set_completed_cb(&a, _blinkDoneCb);
+    lv_anim_start(&a);
+}
+
+// ==========================================================
+//  Look-around callbacks
+// ==========================================================
 void CatFace::_lookAnimCb(void *var, int32_t v) {
     CatFace *self = (CatFace *)var;
-    if (self->_cur == CAT_HAPPY || self->_cur == CAT_SLEEPY) return;
+    if (self->_cur == CAT_SLEEPY || self->_cur == CAT_TALKING) return;
     self->_lookDX = mix16(0, self->_lookTgtDX, v);
     self->_lookDY = mix16(0, self->_lookTgtDY, v);
     self->_render();
@@ -159,62 +206,23 @@ void CatFace::_lookAnimCb(void *var, int32_t v) {
 
 void CatFace::_lookDoneCb(lv_anim_t *a) {
     CatFace *self = (CatFace *)a->var;
+    if ((uintptr_t)lv_anim_get_user_data(a) != self->_animEpoch) return;
     self->_lookDX = 0;
     self->_lookDY = 0;
     self->_render();
     self->_scheduleLook();
 }
 
-void CatFace::_mouthAnimCb(void *var, int32_t v) {
-    CatFace *self = (CatFace *)var;
-    int16_t mw = mix16(14, 24, v);
-    int16_t mh = mix16(10, 20, v);
-    lv_obj_set_size(self->_mouth, mw, mh);
-    lv_obj_set_style_radius(self->_mouth, (mw < mh ? mw : mh) / 2, 0);
-    lv_obj_set_pos(self->_mouth, MOUTH_X - mw / 2, MOUTH_Y - mh / 2);
-}
-
-void CatFace::_maskAnimCb(void *var, int32_t v) {
-    CatFace *self = (CatFace *)var;
-    self->_maskDY = (int16_t)v;
-    self->_render();
-}
-
-void CatFace::_maskFadeDoneCb(lv_anim_t *a) {
-    CatFace *self = (CatFace *)a->var;
-    if (self->_maskDY >= MASK_DY_OFF) {
-        lv_obj_add_flag(self->_maskL, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_add_flag(self->_maskR, LV_OBJ_FLAG_HIDDEN);
-    }
-}
-
-// ==========================================================
-//  Schedule self-repeating blink
-// ==========================================================
-void CatFace::_scheduleBlink() {
-    lv_anim_t a;
-    lv_anim_init(&a);
-    lv_anim_set_var(&a, this);
-    lv_anim_set_values(&a, 0, 1000);
-    lv_anim_set_duration(&a, BLINK_CLOSE_DUR);
-    lv_anim_set_reverse_duration(&a, BLINK_OPEN_DUR);
-    lv_anim_set_delay(&a, rng(4000, 10000));
-    lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
-    lv_anim_set_exec_cb(&a, _blinkAnimCb);
-    lv_anim_set_completed_cb(&a, _blinkDoneCb);
-    lv_anim_start(&a);
-}
-
-// ==========================================================
-//  Schedule self-repeating idle look-around
-// ==========================================================
 void CatFace::_scheduleLook() {
+    if (_cur == CAT_HAPPY || _cur == CAT_TALKING) return;
+
     _lookTgtDX = (int16_t)rng(-8, 9);
     _lookTgtDY = (int16_t)rng(-5, 6);
 
     lv_anim_t a;
     lv_anim_init(&a);
     lv_anim_set_var(&a, this);
+    lv_anim_set_user_data(&a, (void *)(uintptr_t)_animEpoch);
     lv_anim_set_values(&a, 0, 1000);
     lv_anim_set_duration(&a, LOOK_MOVE_DUR);
     lv_anim_set_reverse_duration(&a, LOOK_MOVE_DUR);
@@ -227,24 +235,123 @@ void CatFace::_scheduleLook() {
 }
 
 // ==========================================================
+//  Talking — squeeze/unsquash loop
+//
+//  _talkExecCbL / R: exec callbacks for left and right eye.
+//  Each receives t = 0..1000 and interpolates from
+//  the previous stage's target to the current stage's target.
+//
+//  The stage table holds absolute targets; the "from" state is
+//  always the previous stage's "to" (wrapping stage 3 → stage 0).
+// ==========================================================
+void CatFace::_talkExecCbL(void *var, int32_t t) {
+    CatFace *self = (CatFace *)var;
+    if (self->_talkStage < 0) return;
+
+    int8_t  stage  = self->_talkStage;
+    int8_t  prev   = (stage == 0) ? 3 : stage - 1;
+    EyeState from  = TALK_STAGES[prev].toL;
+    EyeState to    = TALK_STAGES[stage].toL;
+    EyeState cur   = _lerpState(from, to, t);
+
+    // Composite with blink — no look offset during talking
+    if (self->_blinkFactor > 0)
+        cur.h = mix16(cur.h, 6, self->_blinkFactor);
+
+    self->_placeEye(self->_eyeL, cur);
+}
+
+void CatFace::_talkExecCbR(void *var, int32_t t) {
+    CatFace *self = (CatFace *)var;
+    if (self->_talkStage < 0) return;
+
+    int8_t  stage  = self->_talkStage;
+    int8_t  prev   = (stage == 0) ? 3 : stage - 1;
+    EyeState from  = TALK_STAGES[prev].toR;
+    EyeState to    = TALK_STAGES[stage].toR;
+    EyeState cur   = _lerpState(from, to, t);
+
+    if (self->_blinkFactor > 0)
+        cur.h = mix16(cur.h, 6, self->_blinkFactor);
+
+    self->_placeEye(self->_eyeR, cur);
+}
+
+// Called when both left AND right animations for a stage complete.
+// We use the RIGHT eye's done callback as the master trigger for
+// advancing the stage (left and right run identical durations).
+void CatFace::_talkDoneCb(lv_anim_t *a) {
+    CatFace *self = (CatFace *)a->var;
+
+    // Epoch guard — discard if _apply() ran while we were in flight
+    if ((uintptr_t)lv_anim_get_user_data(a) != self->_animEpoch) return;
+    if (self->_talkStage < 0) return;
+
+    // Advance to next stage (wrap 3 → 0 for infinite loop)
+    int8_t next = (self->_talkStage + 1) % 4;
+    self->_startTalkStage(next);
+}
+
+void CatFace::_startTalkStage(int stage, uint32_t delay) {
+    _talkStage = (int8_t)stage;
+    const TalkStage &s = TALK_STAGES[stage];
+
+    // Re-use the two pre-allocated lv_anim_t buffers; LVGL copies
+    // them internally on lv_anim_start so the struct can be stack-local,
+    // but we keep them as members to avoid any inadvertent aliasing.
+    lv_anim_init(&_talkAnimL);
+    lv_anim_set_var(&_talkAnimL, this);
+    lv_anim_set_user_data(&_talkAnimL, (void *)(uintptr_t)_animEpoch);
+    lv_anim_set_values(&_talkAnimL, 0, 1000);
+    lv_anim_set_duration(&_talkAnimL, s.dur);
+    lv_anim_set_delay(&_talkAnimL, delay);
+    lv_anim_set_path_cb(&_talkAnimL, s.path);
+    lv_anim_set_exec_cb(&_talkAnimL, _talkExecCbL);
+    // Left eye: no done callback — driven by right master
+    lv_anim_start(&_talkAnimL);
+
+    lv_anim_init(&_talkAnimR);
+    lv_anim_set_var(&_talkAnimR, this);
+    lv_anim_set_user_data(&_talkAnimR, (void *)(uintptr_t)_animEpoch);
+    lv_anim_set_values(&_talkAnimR, 0, 1000);
+    lv_anim_set_duration(&_talkAnimR, s.dur);
+    lv_anim_set_delay(&_talkAnimR, delay);
+    lv_anim_set_path_cb(&_talkAnimR, s.path);
+    lv_anim_set_exec_cb(&_talkAnimR, _talkExecCbR);
+    lv_anim_set_completed_cb(&_talkAnimR, _talkDoneCb);  // right is master
+    lv_anim_start(&_talkAnimR);
+}
+
+void CatFace::_startTalking(uint32_t initialDelay) {
+    _talkStage = -1;    // will be set by _startTalkStage
+    _startTalkStage(0, initialDelay);
+}
+
+void CatFace::_stopTalking() {
+    _talkStage = -1;
+    lv_anim_delete(this, _talkExecCbL);
+    lv_anim_delete(this, _talkExecCbR);
+}
+
+// ==========================================================
 //  Apply expression — starts smooth morph animation
 // ==========================================================
 void CatFace::_apply(CatExpression e) {
+    // Stop everything from the previous expression
+    _stopTalking();
     lv_anim_delete(this, _exprAnimCb);
     lv_anim_delete(this, _blinkAnimCb);
     lv_anim_delete(this, _lookAnimCb);
-    lv_anim_delete(this, _mouthAnimCb);
-    lv_anim_delete(this, _maskAnimCb);
 
+    _animEpoch++;
     _blinkFactor = 0;
     _lookDX = 0;
     _lookDY = 0;
 
     _fromL = _baseL;
     _fromR = _baseR;
-    _cur = e;
 
-    lv_obj_add_flag(_mouth, LV_OBJ_FLAG_HIDDEN);
+    _cur = e;
 
     switch (e) {
     case CAT_NEUTRAL:
@@ -253,8 +360,8 @@ void CatFace::_apply(CatExpression e) {
         break;
 
     case CAT_HAPPY:
-        _stL = {EYE_L_X, EYE_Y, HAPPY_EYE_D, HAPPY_EYE_D, 0};
-        _stR = {EYE_R_X, EYE_Y, HAPPY_EYE_D, HAPPY_EYE_D, 0};
+        _stL = {EYE_L_X, (int16_t)(EYE_Y - 5), 95, 55, 0};
+        _stR = {EYE_R_X, (int16_t)(EYE_Y - 5), 95, 55, 0};
         break;
 
     case CAT_SAD:
@@ -277,32 +384,16 @@ void CatFace::_apply(CatExpression e) {
         _stR = {(int16_t)(EYE_R_X + 5), (int16_t)(EYE_Y - 5), 110, 110, 0};
         break;
 
-    case CAT_TALKING: {
-        _stL = {EYE_L_X, EYE_Y, EYE_D, EYE_D, 0};
-        _stR = {EYE_R_X, EYE_Y, EYE_D, EYE_D, 0};
-
-        lv_obj_set_size(_mouth, 14, 10);
-        lv_obj_set_style_radius(_mouth, 5, 0);
-        lv_obj_set_pos(_mouth, MOUTH_X - 7, MOUTH_Y - 5);
-        lv_obj_remove_flag(_mouth, LV_OBJ_FLAG_HIDDEN);
-
-        lv_anim_t ma;
-        lv_anim_init(&ma);
-        lv_anim_set_var(&ma, this);
-        lv_anim_set_values(&ma, 0, 1000);
-        lv_anim_set_duration(&ma, MOUTH_DUR);
-        lv_anim_set_reverse_duration(&ma, MOUTH_DUR);
-        lv_anim_set_path_cb(&ma, lv_anim_path_ease_in_out);
-        lv_anim_set_exec_cb(&ma, _mouthAnimCb);
-        lv_anim_set_repeat_count(&ma, LV_ANIM_REPEAT_INFINITE);
-        lv_anim_start(&ma);
+    case CAT_TALKING:
+        // Eyes hold neutral geometry; the talk-loop animates on top
+        _stL = TALK_BASE_L;
+        _stR = TALK_BASE_R;
         break;
-    }
 
     default: break;
     }
 
-    // Start expression morph animation
+    // Kick off the expression morph (0 → 1000 over EXPR_DUR ms)
     _exprProgress = 0;
     lv_anim_t a;
     lv_anim_init(&a);
@@ -313,22 +404,9 @@ void CatFace::_apply(CatExpression e) {
     lv_anim_set_exec_cb(&a, _exprAnimCb);
     lv_anim_start(&a);
 
-    // Mask slide: up to form crescent, down to clear
-    int16_t targetDY = (e == CAT_HAPPY) ? MASK_DY_ON : MASK_DY_OFF;
-    if (targetDY != _maskDY) {
-        if (targetDY < MASK_DY_OFF) {
-            lv_obj_remove_flag(_maskL, LV_OBJ_FLAG_HIDDEN);
-            lv_obj_remove_flag(_maskR, LV_OBJ_FLAG_HIDDEN);
-        }
-        lv_anim_t fa;
-        lv_anim_init(&fa);
-        lv_anim_set_var(&fa, this);
-        lv_anim_set_values(&fa, _maskDY, targetDY);
-        lv_anim_set_duration(&fa, EXPR_DUR);
-        lv_anim_set_path_cb(&fa, lv_anim_path_ease_in_out);
-        lv_anim_set_exec_cb(&fa, _maskAnimCb);
-        lv_anim_set_completed_cb(&fa, _maskFadeDoneCb);
-        lv_anim_start(&fa);
+    if (e == CAT_TALKING) {
+        // Delay so the squeeze loop starts only after the morph settles
+        _startTalking(EXPR_DUR);
     }
 
     _scheduleBlink();
@@ -358,28 +436,7 @@ void CatFace::create(lv_obj_t *parent) {
     lv_obj_remove_flag(_eyeR,
         (lv_obj_flag_t)(LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE));
 
-    // Crescent masks for Happy (bg-colored circles above eyes)
-    auto makeMask = [&](lv_obj_t *&m) {
-        m = lv_obj_create(_scr);
-        lv_obj_remove_style_all(m);
-        lv_obj_set_style_bg_color(m, COL_BG, 0);
-        lv_obj_set_style_bg_opa(m, LV_OPA_COVER, 0);
-        lv_obj_remove_flag(m,
-            (lv_obj_flag_t)(LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE));
-        lv_obj_add_flag(m, LV_OBJ_FLAG_HIDDEN);
-    };
-    makeMask(_maskL);
-    makeMask(_maskR);
-
-    _mouth = lv_obj_create(_scr);
-    lv_obj_remove_style_all(_mouth);
-    lv_obj_set_style_bg_color(_mouth, COL_MOUTH, 0);
-    lv_obj_set_style_bg_opa(_mouth, LV_OPA_COVER, 0);
-    lv_obj_remove_flag(_mouth,
-        (lv_obj_flag_t)(LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE));
-    lv_obj_add_flag(_mouth, LV_OBJ_FLAG_HIDDEN);
-
-    // Eyes grow from center on boot — a nice pop-in effect
+    // Eyes grow from zero on boot — pop-in effect
     _baseL = {EYE_L_X, EYE_Y, 0, 0, 0};
     _baseR = {EYE_R_X, EYE_Y, 0, 0, 0};
 
@@ -387,20 +444,22 @@ void CatFace::create(lv_obj_t *parent) {
 }
 
 // ==========================================================
-//  Update — gesture handling only (animations are self-driving)
+//  Update — gesture handling (animations are self-driving)
 // ==========================================================
 void CatFace::update() {
     uint32_t now = lv_tick_get();
 
-    static GESTURE prevG = NONE;
     GESTURE g = touch_data.gesture;
 
-    if (g != NONE && g != prevG) {
+    if (g != NONE && g != _prevGesture) {
         Serial.printf("[CatFace] gesture=%d\n", (int)g);
-        if (g == SINGLE_CLICK || g == LONG_PRESS) {
+        if (g == LONG_PRESS) {
+            Serial.println("[CatFace] Long press");
+            if (_longPressCb) _longPressCb();
+        } else if (g == SINGLE_CLICK) {
             if (_cur != CAT_HAPPY) _baseExpr = _cur;
             _touchHappyEnd = now + 2000;
-            Serial.println("[CatFace] Touch -> Happy");
+            Serial.println("[CatFace] Tap -> Happy");
             _apply(CAT_HAPPY);
         } else if (g == SWIPE_RIGHT || g == SWIPE_DOWN) {
             _touchHappyEnd = 0;
@@ -416,7 +475,7 @@ void CatFace::update() {
             _apply(_baseExpr);
         }
     }
-    prevG = g;
+    _prevGesture = g;
 
     if (_touchHappyEnd > 0 && now >= _touchHappyEnd) {
         _touchHappyEnd = 0;

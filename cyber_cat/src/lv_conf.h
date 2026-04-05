@@ -76,11 +76,9 @@
 
  /** Set an address for the memory pool instead of allocating it as a normal array. Can be in external SRAM too. */
  #define LV_MEM_ADR 0 /**< 0: unused*/
- /* Instead of an address give a memory allocator that will be called to get a memory pool for LVGL. E.g. my_malloc */
- #if LV_MEM_ADR == 0
- #undef LV_MEM_POOL_INCLUDE
- #undef LV_MEM_POOL_ALLOC
- #endif
+ /* Route LVGL heap to PSRAM to free up ~64 KB of internal SRAM */
+ #define LV_MEM_POOL_INCLUDE "esp32-hal-psram.h"
+ #define LV_MEM_POOL_ALLOC(size) ps_malloc(size)
 #endif /*LV_USE_STDLIB_MALLOC == LV_STDLIB_BUILTIN*/
 
 /*====================
@@ -107,7 +105,7 @@
  * - LV_OS_MQX
  * - LV_OS_SDL2
  * - LV_OS_CUSTOM */
-#define LV_USE_OS LV_OS_NONE
+#define LV_USE_OS LV_OS_FREERTOS
 
 #if LV_USE_OS == LV_OS_CUSTOM
  #define LV_OS_CUSTOM_INCLUDE 
@@ -149,7 +147,7 @@
  * It should be at least `LV_DRAW_LAYER_SIMPLE_BUF_SIZE` sized but if transformed layers are also used
  * it should be enough to store the largest widget too (width x height x 4 area).
  * Set it to 0 to have no limit. */
-#define LV_DRAW_LAYER_MAX_MEMORY 0 /**< No limit by default [bytes]*/
+#define LV_DRAW_LAYER_MAX_MEMORY (32 * 1024) /**< Cap at 32 KB to avoid OOM on 64 KB LVGL heap [bytes]*/
 
 /** Stack size of drawing thread.
  * NOTE: If FreeType or ThorVG is enabled, it is recommended to set it to 32KB or more.

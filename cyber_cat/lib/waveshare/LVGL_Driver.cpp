@@ -63,7 +63,7 @@ static void LVGL_Loop(void *parameter) {
     lvgl_port_lock(0);
     lv_timer_handler();
     lvgl_port_unlock();
-    vTaskDelay(pdMS_TO_TICKS(5));
+    vTaskDelay(pdMS_TO_TICKS(16));
   }
   vTaskDelete(NULL);
 }
@@ -71,7 +71,8 @@ static void LVGL_Loop(void *parameter) {
 void Lvgl_Init(void) {
   lvgl_port_lock_init();
 
-  bufSize = EXAMPLE_LCD_WIDTH * EXAMPLE_LCD_HEIGHT;
+  // Partial render: 1/10 screen stripe (~26 KB each) instead of full frame (259 KB each)
+  bufSize = LVGL_BUF_LEN;
   disp_draw_buf1 = (lv_color_t *)heap_caps_malloc(bufSize * 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
   disp_draw_buf2 = (lv_color_t *)heap_caps_malloc(bufSize * 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 
@@ -80,7 +81,7 @@ void Lvgl_Init(void) {
 
   lv_display_t *disp = lv_display_create(LCD_WIDTH, LCD_HEIGHT);
   lv_display_set_flush_cb(disp, my_disp_flush);
-  lv_display_set_buffers(disp, disp_draw_buf1, disp_draw_buf2, bufSize * 2, LV_DISPLAY_RENDER_MODE_FULL);
+  lv_display_set_buffers(disp, disp_draw_buf1, disp_draw_buf2, bufSize * 2, LV_DISPLAY_RENDER_MODE_PARTIAL);
 
   lv_indev_t *indev = lv_indev_create();
   lv_indev_set_type(indev, LV_INDEV_TYPE_POINTER);
