@@ -282,7 +282,7 @@ void setup() {
     lvgl_port_unlock();
 
     Serial.println("[5/6] WiFi & Cloud...");
-    wifiInit(WIFI_SSID, WIFI_PASS);
+    wifiInit(WIFI_SSID_1, WIFI_PASS_1);
     cloud.begin(LLM_API_KEY, LLM_API_BASE, LLM_MODEL,
                 STT_API_KEY, STT_API_BASE,
                 TTS_API_KEY, TTS_API_BASE, TTS_MODEL, TTS_VOICE);
