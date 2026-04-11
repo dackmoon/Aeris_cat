@@ -29,6 +29,8 @@
 #define HAPPY_BLINK_OPEN  400
 #define LOOK_MOVE_DUR     250
 #define LOOK_HOLD_DUR    1000
+#define LISTEN_PULSE_CLOSE 150   // Listening: subtle eye pulse (not a full blink)
+#define LISTEN_PULSE_OPEN  200
 
 // ==========================================================
 //  Talking — 4-stage squeeze/unsquash loop
@@ -80,8 +82,7 @@ CatFace catFace;
 
 const char *catExprName(CatExpression e) {
     static const char *n[] = {
-        "Neutral", "Happy", "Sad", "Angry",
-        "Sleepy", "Curious", "Talking"
+        "Neutral", "Happy", "Listening", "Thinking", "Sleepy", "Talking"
     };
     static_assert(sizeof(n) / sizeof(n[0]) == CAT_EXPR_COUNT,
                   "catExprName: array out of sync with CAT_EXPR_COUNT");
@@ -136,14 +137,18 @@ void CatFace::_render() {
         if (_cur == CAT_HAPPY) {
             rL.h = mix16(rL.h, 4, _blinkFactor);
             rR.h = mix16(rR.h, 4, _blinkFactor);
+        } else if (_cur == CAT_LISTENING) {
+            // Pronounced pulse: shrinks to ~60% of base size
+            rL.h = mix16(rL.h, 70, _blinkFactor);
+            rR.h = mix16(rR.h, 65, _blinkFactor);
         } else {
             rL.h = mix16(rL.h, 6, _blinkFactor);
             rR.h = mix16(rR.h, 6, _blinkFactor);
         }
     }
 
-    int16_t lx = (_cur == CAT_TALKING) ? 0 : _lookDX;
-    int16_t ly = (_cur == CAT_TALKING) ? 0 : _lookDY;
+    int16_t lx = (_cur == CAT_TALKING || _cur == CAT_LISTENING) ? 0 : _lookDX;
+    int16_t ly = (_cur == CAT_TALKING || _cur == CAT_LISTENING) ? 0 : _lookDY;
     _placeEye(_eyeL, rL, lx, ly);
     _placeEye(_eyeR, rR, lx, ly);
 }
@@ -178,16 +183,25 @@ void CatFace::_blinkDoneCb(lv_anim_t *a) {
 
 void CatFace::_scheduleBlink() {
     if (_cur == CAT_SLEEPY || _cur == CAT_TALKING) return;
-    bool happy = (_cur == CAT_HAPPY);
+    bool happy     = (_cur == CAT_HAPPY);
+    bool listening = (_cur == CAT_LISTENING);
     lv_anim_t a;
     lv_anim_init(&a);
     lv_anim_set_var(&a, this);
     lv_anim_set_user_data(&a, (void *)(uintptr_t)_animEpoch);
     lv_anim_set_values(&a, 0, 1000);
-    lv_anim_set_duration(&a, happy ? HAPPY_BLINK_CLOSE : BLINK_CLOSE_DUR);
-    lv_anim_set_reverse_duration(&a, happy ? HAPPY_BLINK_OPEN : BLINK_OPEN_DUR);
-    lv_anim_set_delay(&a, happy ? rng(2500, 5000) : rng(4000, 10000));
-    lv_anim_set_path_cb(&a, happy ? lv_anim_path_ease_in_out : lv_anim_path_ease_out);
+    if (listening) {
+        // Subtle heartbeat pulse — faster, gentler than a blink
+        lv_anim_set_duration(&a, LISTEN_PULSE_CLOSE);
+        lv_anim_set_reverse_duration(&a, LISTEN_PULSE_OPEN);
+        lv_anim_set_delay(&a, rng(600, 900));
+        lv_anim_set_path_cb(&a, lv_anim_path_ease_in_out);
+    } else {
+        lv_anim_set_duration(&a, happy ? HAPPY_BLINK_CLOSE : BLINK_CLOSE_DUR);
+        lv_anim_set_reverse_duration(&a, happy ? HAPPY_BLINK_OPEN : BLINK_OPEN_DUR);
+        lv_anim_set_delay(&a, happy ? rng(2500, 5000) : rng(4000, 10000));
+        lv_anim_set_path_cb(&a, happy ? lv_anim_path_ease_in_out : lv_anim_path_ease_out);
+    }
     lv_anim_set_exec_cb(&a, _blinkAnimCb);
     lv_anim_set_completed_cb(&a, _blinkDoneCb);
     lv_anim_start(&a);
@@ -198,7 +212,8 @@ void CatFace::_scheduleBlink() {
 // ==========================================================
 void CatFace::_lookAnimCb(void *var, int32_t v) {
     CatFace *self = (CatFace *)var;
-    if (self->_cur == CAT_SLEEPY || self->_cur == CAT_TALKING) return;
+    if (self->_cur == CAT_SLEEPY || self->_cur == CAT_TALKING ||
+        self->_cur == CAT_LISTENING) return;
     self->_lookDX = mix16(0, self->_lookTgtDX, v);
     self->_lookDY = mix16(0, self->_lookTgtDY, v);
     self->_render();
@@ -214,10 +229,12 @@ void CatFace::_lookDoneCb(lv_anim_t *a) {
 }
 
 void CatFace::_scheduleLook() {
-    if (_cur == CAT_HAPPY || _cur == CAT_TALKING) return;
+    if (_cur == CAT_HAPPY || _cur == CAT_TALKING || _cur == CAT_LISTENING) return;
 
-    _lookTgtDX = (int16_t)rng(-8, 9);
-    _lookTgtDY = (int16_t)rng(-5, 6);
+    // Thinking: reduced amplitude — eyes drift slightly, not widely
+    bool thinking = (_cur == CAT_THINKING);
+    _lookTgtDX = (int16_t)rng(thinking ? -4 : -8, thinking ? 5 : 9);
+    _lookTgtDY = (int16_t)rng(thinking ? -3 : -5, thinking ? 4 : 6);
 
     lv_anim_t a;
     lv_anim_init(&a);
@@ -364,24 +381,23 @@ void CatFace::_apply(CatExpression e) {
         _stR = {EYE_R_X, (int16_t)(EYE_Y - 5), 95, 55, 0};
         break;
 
-    case CAT_SAD:
-        _stL = {(int16_t)(EYE_L_X - 3), (int16_t)(EYE_Y + 12), 75, 75, 0};
-        _stR = {(int16_t)(EYE_R_X + 3), (int16_t)(EYE_Y + 12), 75, 75, 0};
+    case CAT_LISTENING:
+        // Enlarged + asymmetric — clearly different from Neutral
+        // Left eye notably bigger, both shifted up to look alert
+        _stL = {EYE_L_X,      (int16_t)(EYE_Y - 8), 118, 118, 0};
+        _stR = {(int16_t)(EYE_R_X + 3), (int16_t)(EYE_Y - 6), 110, 110, 0};
         break;
 
-    case CAT_ANGRY:
-        _stL = {EYE_L_X, EYE_Y, 70, 35, -200};
-        _stR = {EYE_R_X, EYE_Y, 70, 35,  200};
+    case CAT_THINKING:
+        // Slightly narrowed + outward-shifted + subtle tilt
+        // Conveys "eyes unfocused, gazing into the distance"
+        _stL = {(int16_t)(EYE_L_X - 2), EYE_Y, 88, 78, -50};
+        _stR = {(int16_t)(EYE_R_X + 2), EYE_Y, 88, 78,  50};
         break;
 
     case CAT_SLEEPY:
         _stL = {EYE_L_X, EYE_Y, 80, 8, 0};
         _stR = {EYE_R_X, EYE_Y, 80, 8, 0};
-        break;
-
-    case CAT_CURIOUS:
-        _stL = {(int16_t)(EYE_L_X + 5), EYE_Y, 70, 70, 0};
-        _stR = {(int16_t)(EYE_R_X + 5), (int16_t)(EYE_Y - 5), 110, 110, 0};
         break;
 
     case CAT_TALKING:
@@ -440,6 +456,7 @@ void CatFace::create(lv_obj_t *parent) {
     _baseL = {EYE_L_X, EYE_Y, 0, 0, 0};
     _baseR = {EYE_R_X, EYE_Y, 0, 0, 0};
 
+    _lastTouchMs = millis();    // idle timer starts from creation
     _apply(CAT_NEUTRAL);
 }
 
@@ -453,26 +470,29 @@ void CatFace::update() {
 
     if (g != NONE && g != _prevGesture) {
         Serial.printf("[CatFace] gesture=%d\n", (int)g);
+        _lastTouchMs = millis();
+
         if (g == LONG_PRESS) {
             Serial.println("[CatFace] Long press");
+            // Wake from SLEEPY first — caller handles the chat trigger
+            if (_cur == CAT_SLEEPY) {
+                _apply(CAT_NEUTRAL);
+            }
             if (_longPressCb) _longPressCb();
         } else if (g == SINGLE_CLICK) {
-            if (_cur != CAT_HAPPY) _baseExpr = _cur;
-            _touchHappyEnd = now + 2000;
-            Serial.println("[CatFace] Tap -> Happy");
-            _apply(CAT_HAPPY);
-        } else if (g == SWIPE_RIGHT || g == SWIPE_DOWN) {
-            _touchHappyEnd = 0;
-            int ne = ((int)_baseExpr + 1) % CAT_EXPR_COUNT;
-            _baseExpr = (CatExpression)ne;
-            Serial.printf("[CatFace] Swipe -> %s\n", catExprName(_baseExpr));
-            _apply(_baseExpr);
-        } else if (g == SWIPE_LEFT || g == SWIPE_UP) {
-            _touchHappyEnd = 0;
-            int ne = ((int)_baseExpr - 1 + CAT_EXPR_COUNT) % CAT_EXPR_COUNT;
-            _baseExpr = (CatExpression)ne;
-            Serial.printf("[CatFace] Swipe -> %s\n", catExprName(_baseExpr));
-            _apply(_baseExpr);
+            // Wake from SLEEPY on tap
+            if (_cur == CAT_SLEEPY) {
+                _apply(CAT_NEUTRAL);
+            } else {
+                // Allow caller (main.cpp) to intercept the tap
+                bool consumed = _tapCb ? _tapCb() : false;
+                if (!consumed) {
+                    if (_cur != CAT_HAPPY) _baseExpr = _cur;
+                    _touchHappyEnd = now + 2000;
+                    Serial.println("[CatFace] Tap -> Happy");
+                    _apply(CAT_HAPPY);
+                }
+            }
         }
     }
     _prevGesture = g;

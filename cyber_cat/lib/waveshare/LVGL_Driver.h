@@ -15,7 +15,13 @@
 
 #define EXAMPLE_LVGL_TICK_PERIOD_MS 10
 
+typedef void (*lvgl_update_cb_t)(void);
+
 void Lvgl_Init(void);
 void Lvgl_Loop(void);
 bool lvgl_port_lock(uint32_t timeout_ms);
 void lvgl_port_unlock(void);
+void lvgl_set_update_cb(lvgl_update_cb_t cb);
+void lvgl_set_flush_skip(bool skip);
+void lvgl_set_touch_skip(bool skip);
+uint32_t lvgl_get_loop_count(void);

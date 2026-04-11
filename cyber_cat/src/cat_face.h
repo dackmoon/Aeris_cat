@@ -4,10 +4,9 @@
 enum CatExpression {
     CAT_NEUTRAL = 0,
     CAT_HAPPY,
-    CAT_SAD,
-    CAT_ANGRY,
+    CAT_LISTENING,   // recording — large asymmetric eyes, subtle pulse
+    CAT_THINKING,    // waiting for AI — narrowed tilted eyes, slow gaze
     CAT_SLEEPY,
-    CAT_CURIOUS,
     CAT_TALKING,
     CAT_EXPR_COUNT
 };
@@ -15,6 +14,7 @@ enum CatExpression {
 const char *catExprName(CatExpression e);
 
 typedef void (*LongPressCb)();
+typedef bool (*TapCb)();     // return true = tap consumed (skip default Happy)
 
 class CatFace {
 public:
@@ -24,9 +24,11 @@ public:
     void create(lv_obj_t *parent);
     void setExpression(CatExpression expr);
     CatExpression getExpression() const { return _cur; }
+    uint32_t lastInteractMs() const { return _lastTouchMs; }
     void update();
 
     void onLongPress(LongPressCb cb) { _longPressCb = cb; }
+    void onTap(TapCb cb)             { _tapCb = cb; }
 
 private:
     lv_obj_t *_scr  = nullptr;
@@ -53,9 +55,11 @@ private:
     lv_anim_t _talkAnimR{};
     int8_t    _talkStage = -1;         // -1 = idle, 0-3 = current loop stage
 
+    uint32_t _lastTouchMs   = 0;      // millis() of last processed gesture
     uint8_t  _prevGesture   = 0;      // GESTURE enum value (0 = NONE)
     uint32_t _touchHappyEnd = 0;
     LongPressCb _longPressCb = nullptr;
+    TapCb       _tapCb       = nullptr;
 
     void _placeEye(lv_obj_t *eye, const EyeState &st,
                    int16_t dx = 0, int16_t dy = 0);
