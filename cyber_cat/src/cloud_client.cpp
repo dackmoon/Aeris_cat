@@ -10,6 +10,7 @@
 
 #include "cloud_client.h"
 #include "es8311_spk.h"
+#include "secrets.h"
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
@@ -155,6 +156,7 @@ CloudState  CloudClient::poll()          const { return _state; }
 const char *CloudClient::getResponse()   const { return _response; }
 const char *CloudClient::getError()      const { return _errMsg; }
 const char *CloudClient::getTranscript() const { return _transcript ? _transcript : ""; }
+const char *CloudClient::getEmotion()    const { return _emotion; }
 
 void CloudClient::consume() { _state = CLOUD_IDLE; }
 
@@ -407,9 +409,26 @@ void CloudClient::_sttWorkerTask(void *param) {
     CloudClient *self = (CloudClient *)param;
     Serial.println("[Cloud] STT worker started");
 
+    // Clear Phase 5 fields at the start of every request
+    self->_emotion[0]  = '\0';
+    self->_audioUrl[0] = '\0';
+
+#ifdef BACKEND_URL
+    // ---- Phase 5: unified backend ----
+    bool ok = self->_doBackendChat();
+
+    if (self->_pendingPcm) {
+        free(self->_pendingPcm);
+        self->_pendingPcm   = nullptr;
+        self->_pendingBytes = 0;
+    }
+    self->_state = ok ? CLOUD_DONE : CLOUD_ERROR;
+    Serial.printf("[Cloud] Backend chat %s\n", ok ? "done" : "failed");
+
+#else
+    // ---- Phase 4: direct STT → LLM ----
     bool sttOk = self->_doStt();
 
-    // Free audio buffer regardless
     if (self->_pendingPcm) {
         free(self->_pendingPcm);
         self->_pendingPcm   = nullptr;
@@ -423,7 +442,6 @@ void CloudClient::_sttWorkerTask(void *param) {
         return;
     }
 
-    // STT succeeded — signal main loop so it can show transcript immediately
     self->_state = CLOUD_STT_DONE;
     Serial.println("[Cloud] STT done, sending to LLM...");
     bool chatOk = self->_doChat(self->_pendingMsg);
@@ -434,6 +452,8 @@ void CloudClient::_sttWorkerTask(void *param) {
         self->_pendingMsg = nullptr;
     }
     Serial.println("[Cloud] STT worker done");
+#endif
+
     vTaskDelete(nullptr);
 }
 
@@ -474,8 +494,15 @@ bool CloudClient::sendTTS(const char *text) {
 
 // =============================================================
 //  Internal: TTS  (POST /audio/speech → WAV → es8311Play)
+//  Phase 5: if _audioUrl is set, skip SiliconFlow and use backend URL directly.
 // =============================================================
 bool CloudClient::_doTts(const char *text) {
+#ifdef BACKEND_URL
+    if (_audioUrl[0] != '\0') {
+        return _downloadAndPlayWav(_audioUrl);
+    }
+#endif
+
     WiFiClientSecure client;
     client.setInsecure();
 
@@ -596,3 +623,145 @@ void CloudClient::_ttsWorkerTask(void *param) {
     Serial.printf("[Cloud] TTS worker done (%s)\n", ok ? "OK" : "FAIL");
     vTaskDelete(nullptr);
 }
+
+#ifdef BACKEND_URL
+// =============================================================
+//  Phase 5: POST WAV → unified backend → parse text+emotion+audio_url
+// =============================================================
+bool CloudClient::_doBackendChat() {
+    // Build WAV in PSRAM: 44-byte header + raw PCM
+    size_t wavSize = 44 + _pendingBytes;
+    uint8_t *wav = (uint8_t *)heap_caps_malloc(wavSize, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!wav) {
+        strlcpy(_errMsg, "Backend: alloc WAV failed", ERR_BUF_SIZE);
+        return false;
+    }
+    buildWavHeader(wav, (uint32_t)_pendingBytes);
+    memcpy(wav + 44, _pendingPcm, _pendingBytes);
+
+    WiFiClient client;   // plain HTTP
+    HTTPClient http;
+    http.setTimeout(HTTP_TIMEOUT_MS);
+
+    char url[128];
+    snprintf(url, sizeof(url), "%s/chat", BACKEND_URL);
+
+    Serial.printf("[Cloud] Backend POST %s (%u bytes WAV)\n", url, (unsigned)wavSize);
+
+    if (!http.begin(client, url)) {
+        strlcpy(_errMsg, "Backend: HTTP begin failed", ERR_BUF_SIZE);
+        heap_caps_free(wav);
+        return false;
+    }
+
+    http.addHeader("Content-Type", "audio/wav");
+    http.addHeader("X-Session-ID", WiFi.macAddress());
+
+    int code = http.POST(wav, wavSize);
+    heap_caps_free(wav);
+
+    bool ok = false;
+    if (code <= 0) {
+        snprintf(_errMsg, ERR_BUF_SIZE, "Backend HTTP error: %s",
+                 http.errorToString(code).c_str());
+        Serial.printf("[Cloud] %s\n", _errMsg);
+    } else if (code != 200) {
+        String resp = http.getString();
+        snprintf(_errMsg, ERR_BUF_SIZE, "Backend HTTP %d: %.180s", code, resp.c_str());
+        Serial.printf("[Cloud] %s\n", _errMsg);
+    } else {
+        String rawBody = http.getString();
+        Serial.printf("[Cloud] Backend response: %.200s\n", rawBody.c_str());
+
+        JsonDocument resp;
+        DeserializationError err = deserializeJson(resp, rawBody);
+        if (err) {
+            snprintf(_errMsg, ERR_BUF_SIZE, "Backend JSON: %s", err.c_str());
+        } else {
+            const char *textReply = resp["text_reply"];
+            const char *emotion   = resp["emotion"];
+            const char *audioUrl  = resp["audio_url"];
+
+            if (textReply && textReply[0] != '\0') {
+                strlcpy(_response,   textReply, RESP_BUF_SIZE);
+                strlcpy(_transcript, textReply, RESP_BUF_SIZE);  // show in ticker
+                ok = true;
+            } else {
+                strlcpy(_errMsg, "Backend: empty text_reply", ERR_BUF_SIZE);
+            }
+            if (emotion)  strlcpy(_emotion,  emotion,  sizeof(_emotion));
+            if (audioUrl) strlcpy(_audioUrl, audioUrl, sizeof(_audioUrl));
+
+            Serial.printf("[Cloud] Backend: text=%s emotion=%s\n",
+                          _response, _emotion);
+        }
+    }
+
+    http.end();
+    return ok;
+}
+
+// =============================================================
+//  Phase 5: GET audio_url → download WAV → es8311Play
+// =============================================================
+bool CloudClient::_downloadAndPlayWav(const char *url) {
+    WiFiClient client;
+    HTTPClient http;
+    http.setTimeout(HTTP_TIMEOUT_MS);
+
+    Serial.printf("[Cloud] Downloading TTS WAV: %s\n", url);
+
+    if (!http.begin(client, url)) {
+        strlcpy(_errMsg, "TTS download: HTTP begin failed", ERR_BUF_SIZE);
+        return false;
+    }
+
+    int code = http.GET();
+    bool ok = false;
+
+    if (code != 200) {
+        snprintf(_errMsg, ERR_BUF_SIZE, "TTS download HTTP %d", code);
+        Serial.printf("[Cloud] %s\n", _errMsg);
+    } else {
+        int contentLen = http.getSize();
+        size_t allocLen = (contentLen > 0 && contentLen <= (int)TTS_MAX_BYTES)
+                          ? (size_t)contentLen : TTS_MAX_BYTES;
+
+        uint8_t *buf = (uint8_t *)heap_caps_malloc(allocLen,
+                                                    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!buf) {
+            strlcpy(_errMsg, "TTS download: alloc failed", ERR_BUF_SIZE);
+        } else {
+            WiFiClient *stream = http.getStreamPtr();
+            size_t totalRead = 0;
+            uint32_t deadline = millis() + HTTP_TIMEOUT_MS;
+            while (totalRead < allocLen && millis() < deadline) {
+                int avail = stream->available();
+                if (avail > 0) {
+                    size_t n = stream->readBytes(buf + totalRead,
+                                                  min((size_t)avail, allocLen - totalRead));
+                    totalRead += n;
+                    if (!http.connected() && stream->available() == 0) break;
+                } else {
+                    vTaskDelay(pdMS_TO_TICKS(5));
+                }
+            }
+            Serial.printf("[Cloud] TTS WAV downloaded %u bytes\n", (unsigned)totalRead);
+
+            if (totalRead >= 44) {
+                es8311BoostForTTS(70);
+                ok = es8311Play(buf, totalRead);
+                es8311RestoreVolume();
+                if (!ok) strlcpy(_errMsg, "TTS download: playback failed", ERR_BUF_SIZE);
+            } else {
+                snprintf(_errMsg, ERR_BUF_SIZE, "TTS download: too small (%u bytes)",
+                         (unsigned)totalRead);
+            }
+            heap_caps_free(buf);
+        }
+    }
+
+    http.end();
+    return ok;
+}
+#endif  // BACKEND_URL

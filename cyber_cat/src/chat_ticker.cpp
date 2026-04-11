@@ -115,3 +115,10 @@ void chatTickerAddAI(const char *text) {
 
     Serial.printf("[Ticker] %s\n", buf);
 }
+
+void chatTickerClear() {
+    if (!s_box) return;
+    if (s_user_lbl) lv_obj_add_flag(s_user_lbl, LV_OBJ_FLAG_HIDDEN);
+    if (s_ai_lbl)   lv_obj_add_flag(s_ai_lbl,   LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_box, LV_OBJ_FLAG_HIDDEN);
+}

@@ -15,3 +15,7 @@ void chatTickerAddUser(const char *text);
 // Append an AI-reply line "[猫] <text>" (warm white).
 // Call while holding the LVGL lock.
 void chatTickerAddAI(const char *text);
+
+// Hide the ticker box immediately (both lines).
+// Call while holding the LVGL lock.
+void chatTickerClear();

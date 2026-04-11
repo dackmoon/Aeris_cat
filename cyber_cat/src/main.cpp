@@ -35,6 +35,8 @@ static bool     _sttShown        = false;
 static uint32_t _touchReEnableMs = 0;
 static uint32_t _talkingStartMs  = 0;
 static uint32_t _talkingDurMs    = 0;
+static uint32_t _tickerClearMs        = 0;     // when to hide the chat ticker (0 = no pending clear)
+static volatile bool _tickerClearNow  = false; // immediate clear request from Core 1
 
 // ============================================================
 //  Cross-core communication: visual updates
@@ -75,18 +77,30 @@ static void enterIdle() {
     audioInputClear();
     lvgl_set_flush_skip(false);
     _touchReEnableMs = millis() + 2000;
+    _tickerClearMs   = millis() + 8000;  // hide chat ticker 8s after returning to idle
     requestExpr(CAT_NEUTRAL);
     Serial.println("[Main] -> IDLE");
 }
 
 static void enterListening() {
     dialogState = DIALOG_LISTENING;
+    _tickerClearMs  = 0;            // cancel pending timed clear
+    _tickerClearNow = true;         // immediately clear ticker on Core 0
     audioInputStart();
     requestExpr(CAT_LISTENING);
     Serial.println("[Main] -> LISTENING");
 }
 
-static void enterTalking(const char *aiText) {
+static CatExpression emotionToExpr(const char *emotion) {
+    if (emotion) {
+        if (strcmp(emotion, "happy")    == 0) return CAT_HAPPY;
+        if (strcmp(emotion, "neutral")  == 0) return CAT_NEUTRAL;
+        if (strcmp(emotion, "thinking") == 0) return CAT_THINKING;
+    }
+    return CAT_TALKING;  // default: "talking" or unknown
+}
+
+static void enterTalking(const char *aiText, CatExpression expr = CAT_TALKING) {
     dialogState = DIALOG_TALKING;
     _talkingStartMs = millis();
     _talkingDurMs   = 30000;  // hard watchdog — TTS should finish well before this
@@ -96,7 +110,7 @@ static void enterTalking(const char *aiText) {
     lvgl_set_flush_skip(false);
     lvgl_port_unlock();
 
-    requestExpr(CAT_TALKING);
+    requestExpr(expr);
 
     // Launch TTS: download WAV from SiliconFlow and play via ES8311 (Core 1 worker)
     if (!cloud.sendTTS(aiText)) {
@@ -170,6 +184,13 @@ static void lvglUpdateCb() {
     if (_exprDirty) {
         catFace.setExpression(_exprPending);
         _exprDirty = false;
+    }
+
+    // Clear chat ticker — immediate request from Core 1 or timed auto-clear
+    if (_tickerClearNow || (_tickerClearMs != 0 && millis() >= _tickerClearMs)) {
+        _tickerClearNow = false;
+        _tickerClearMs  = 0;
+        chatTickerClear();
     }
 
     if (_tickerUserReady) {
@@ -261,7 +282,16 @@ void setup() {
     lvgl_port_unlock();
 
     Serial.println("[5/6] WiFi & Cloud...");
-    wifiInit(WIFI_SSID, WIFI_PASS);
+    static const WifiNetwork wifiNetworks[] = {
+        { WIFI_SSID_1, WIFI_PASS_1 },
+#ifdef WIFI_SSID_2
+        { WIFI_SSID_2, WIFI_PASS_2 },
+#endif
+#ifdef WIFI_SSID_3
+        { WIFI_SSID_3, WIFI_PASS_3 },
+#endif
+    };
+    wifiInit(wifiNetworks, sizeof(wifiNetworks) / sizeof(wifiNetworks[0]));
     cloud.begin(LLM_API_KEY, LLM_API_BASE, LLM_MODEL,
                 STT_API_KEY, STT_API_BASE,
                 TTS_API_KEY, TTS_API_BASE, TTS_MODEL, TTS_VOICE);
@@ -342,12 +372,13 @@ void loop() {
                 _tickerUserReady = true;
             }
         } else if (cs == CLOUD_DONE) {
-            const char *reply = cloud.getResponse();
-            Serial.printf("[Main] AI: %s\n", reply);
+            const char *reply   = cloud.getResponse();
+            CatExpression expr  = emotionToExpr(cloud.getEmotion());
+            Serial.printf("[Main] AI: %s (emotion=%s)\n", reply, cloud.getEmotion());
             strlcpy(_tickerAIBuf, reply, sizeof(_tickerAIBuf));
             _tickerAIReady = true;
             cloud.consume();
-            enterTalking(reply);
+            enterTalking(reply, expr);
         } else if (cs == CLOUD_ERROR) {
             Serial.printf("[Main] Cloud error: %s\n", cloud.getError());
             cloud.consume();

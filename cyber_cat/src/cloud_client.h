@@ -35,6 +35,7 @@ public:
     const char *getResponse()   const;
     const char *getError()      const;
     const char *getTranscript() const;
+    const char *getEmotion()    const;  // "neutral"|"happy"|"thinking"|"talking"
 
     void consume();
 
@@ -46,6 +47,8 @@ private:
     bool _doStt();
     bool _doChat(const char *text);
     bool _doTts(const char *text);
+    bool _doBackendChat();          // Phase 5: unified POST /chat → text+emotion+audio_url
+    bool _downloadAndPlayWav(const char *url);  // Phase 5: GET audio_url → es8311Play
 
     const char *_apiKey     = nullptr;
     const char *_apiBase    = nullptr;
@@ -63,6 +66,8 @@ private:
     char    *_errMsg      = nullptr;
     char    *_transcript  = nullptr;
     char    *_pendingMsg  = nullptr;
+    char     _emotion[32]  = {};   // Phase 5: emotion tag from backend
+    char     _audioUrl[256] = {};  // Phase 5: TTS audio URL from backend
 
     uint8_t *_pendingPcm   = nullptr;
     size_t   _pendingBytes = 0;
