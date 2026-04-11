@@ -290,7 +290,7 @@ Talking 额外层：
 - HTTPS 使用 `setInsecure()`，生产环境需替换为根证书校验
 - LCD flush callback 中 CPU 逐像素做字节序 swap，建议改为 DMA 异步完成回调
 
-### Phase 4: 语音管道 - "让猫能听能说" (进行中 2026-04-08)
+### Phase 4: 语音管道 - "让猫能听能说" (已完成 2026-04-10)
 
 **目标**：实现完整的 语音输入 -> STT -> AI 回复 -> TTS 语音输出 链路
 
@@ -302,7 +302,7 @@ Talking 额外层：
 - [x] 新增 CAT_LISTENING / CAT_THINKING / CAT_TALKING 表情联动
 - [x] **STT 音频上传**：PCM → 设备端构建 WAV 头 → multipart POST → SiliconFlow STT → transcript 自动喂给 LLM
 - [x] **屏幕底部对话条幅**：自定义 GB2312 CJK 字体（3766 字），显示 `[你] 识别文字` 和 `[猫] AI 回复`，按圆屏弦宽定位（240px 宽，y≈300）
-  - [ ] 字幕打印后不会消失（应在下次录音开始或超时后自动清除）
+  - [x] 字幕自动消失：idle 后 8 秒定时清除 + 开始新录音时立即清除（`chatTickerClear()`）
   - [ ] 出现/消失动画（渐显渐隐或滑入滑出）
 - [x] **WDT 崩溃修复**：HTTP worker 绑 Core 1 + 关闭 IDLE 任务 WDT 监控（见踩坑）
 - [x] **TTS 语音合成播放**：AI 回复文字 → SiliconFlow CosyVoice2 → WAV → ES8311 DAC → 喇叭（已验证端到端播放）
@@ -311,21 +311,33 @@ Talking 额外层：
   - 音量 API：`es8311SetVolume(0–100)`，TTS 播放期间临时提升到 70%，播放完恢复用户设定值
   - 调试工具：`TTS_DUMP_SERIAL=1` 可 hex dump WAV 到串口，配套 Python 脚本还原为 `.wav` 文件
   - 硬件自检：`es8311Beep(freq, duration)` 生成正弦波测试喇叭
-- [ ] 删除 `flush_skip` / `touch_skip` 机制，让 LVGL 在 THINKING/TALKING 期间正常渲染（Thinking 动画流畅化）
-- [ ] 音量旋钮控制播放音量
+- 剩余待办已移至 Phase 6（flush_skip 消除、音量旋钮、字幕动画等）
 
 **已完成部分总结**：
 
-V2 板使用 **ES7210 音频 ADC** + 双模拟麦克风，通过共享 I2S 总线采集音频。`es7210_mic.h/.cpp` 实现了 ES7210 的 I2C 寄存器初始化（遵循 Waveshare 官方 `08_esp_sr` 示例的寄存器序列），`audio_input.h/.cpp` 基于遗留 `driver/i2s.h` API 实现录音驱动和 VAD 逻辑。`cloud_client` 新增 STT + TTS 流水线：录音结束后，设备端在 PSRAM 中拼装 44 字节 WAV 头 + PCM 数据，以 `multipart/form-data` 格式 POST 到 SiliconFlow STT，收到 transcript 后自动发起 LLM chat，AI 回复后再调用 SiliconFlow CosyVoice2 TTS 下载 WAV 并通过 ES8311 DAC 播放。整个流程（STT→LLM→TTS→播放）在 Core 1 的独立 FreeRTOS task 中异步完成，主循环只需轮询 `cloud.poll()`。屏幕底部新增 CJK 条幅，STT 完成后显示 `[你]`，AI 回复后切换显示 `[猫]`。
+V2 板使用 **ES7210 音频 ADC** + 双模拟麦克风，通过共享 I2S 总线采集音频。`cloud_client` 支持两种模式：**Phase 5 后端模式**（`BACKEND_URL` 宏定义时，POST 裸 WAV 到统一 `/chat` 接口，后端完成 STT→LLM→TTS 串联）和 **Phase 4 直连模式**（设备端自行调用 SiliconFlow STT + LLM chat + TTS 三个 API）。两种模式通过 `#ifdef BACKEND_URL` 条件编译切换，注释掉 `secrets.h` 中的 `BACKEND_URL` 即回退直连。整个流程在 Core 1 的独立 FreeRTOS task 中异步完成，主循环只需轮询 `cloud.poll()`。屏幕底部 CJK 条幅显示 `[猫]` AI 回复，idle 后 8 秒或开始新录音时自动清除。
 
-**对话交互流程（当前）**：
+**对话交互流程**：
 
+Phase 5 模式（`BACKEND_URL` 已定义）：
 ```
-长按  → LISTENING（VAD 监听，猫切 Listening 表情）
+长按  → LISTENING（VAD 监听，字幕清除，猫切 Listening 表情）
+  自动/点击停止 → THINKING（猫切 Thinking）
+  → PCM → WAV → POST 后端 /chat
+  → 后端：STT → 记忆注入 → LLM → TTS → 情绪分析
+  → JSON {text_reply, emotion, audio_url}
+  → TALKING（猫切 emotion 表情，屏幕显示 [猫] 回复）
+  → GET audio_url → ES8311 播放完毕 → IDLE（猫切 Neutral，8s 后字幕清除）
+  再次长按（录音中）→ 取消，回到 IDLE
+```
+
+Phase 4 模式（`BACKEND_URL` 未定义，回退直连）：
+```
+长按  → LISTENING（VAD 监听，字幕清除，猫切 Listening 表情）
   自动/点击停止 → THINKING（猫切 Thinking，屏幕显示 [你] transcript）
   → PCM → WAV → SiliconFlow STT → transcript → LLM chat
   → AI 回复 → TALKING（猫切 Talking 眼睛律动，屏幕显示 [猫] 回复）
-  → TTS 下载 WAV → ES8311 播放完毕 → IDLE（猫切 Neutral）
+  → SiliconFlow TTS 下载 WAV → ES8311 播放完毕 → IDLE（猫切 Neutral，8s 后字幕清除）
   再次长按（录音中）→ 取消，回到 IDLE
 ```
 
@@ -338,21 +350,22 @@ V2 板使用 **ES7210 音频 ADC** + 双模拟麦克风，通过共享 I2S 总�
 | `VAD_MIN_SPEECH_MS` | 300ms | 最短有效语音，防止误触发 |
 | `AUDIO_MAX_SECONDS` | 30s | 最长录音，超限强制停止 |
 
-**STT / LLM / TTS API 配置**（`secrets.h`）：
+**API 配置**（`secrets.h`）：
 
 | 宏 | 说明 |
 |----|------|
-| `LLM_API_BASE` | LLM 接口基地址（通义千问 / DeepSeek / OpenAI 等） |
+| `BACKEND_URL` | **Phase 5 后端地址**（如 `http://122.51.129.89:8000`）。定义此宏即启用后端模式，注释掉即回退 Phase 4 直连 |
+| `LLM_API_BASE` | LLM 接口基地址（Phase 4 直连用） |
 | `LLM_API_KEY` | LLM API Key |
-| `LLM_MODEL` | 模型名，如 `qwen-turbo` |
-| `STT_API_BASE` | STT 接口基地址（如 `https://api.siliconflow.cn/v1`） |
-| `STT_API_KEY` | STT API Key（SiliconFlow 等） |
-| `TTS_API_BASE` | TTS 接口基地址（如 `https://api.siliconflow.cn/v1`） |
-| `TTS_API_KEY` | TTS API Key（可与 `STT_API_KEY` 相同） |
-| `TTS_MODEL` | TTS 模型名，如 `FunAudioLLM/CosyVoice2-0.5B` |
-| `TTS_VOICE` | 音色名，如 `FunAudioLLM/CosyVoice2-0.5B:alex` |
+| `LLM_MODEL` | 模型名，如 `MiniMax-M2.5` |
+| `STT_API_BASE` | STT 接口基地址（Phase 4 直连用） |
+| `STT_API_KEY` | STT API Key（SiliconFlow） |
+| `TTS_API_BASE` | TTS 接口基地址（Phase 4 直连 / Phase 5 fallback） |
+| `TTS_API_KEY` | TTS API Key |
+| `TTS_MODEL` | TTS 模型名 |
+| `TTS_VOICE` | 音色名，如 `FunAudioLLM/CosyVoice2-0.5B:anna` |
 
-STT 模型固定为 `FunAudioLLM/SenseVoiceSmall`（`cloud_client.cpp` 中修改）。TTS 返回 WAV 格式（`response_format=wav`，16kHz），设备端直接流式写入 ES8311 播放，最大缓冲 500KB（约 15s）。
+Phase 5 模式下设备端只需 `BACKEND_URL` + TTS 配置（作为 `sendTTS` fallback）。TTS 最大缓冲 500KB PSRAM（约 15s @16kHz mono）。
 
 **V2 板 ES7210 + ES8311 音频架构**：
 
@@ -417,89 +430,118 @@ Wire.begin() → es7210Init(16000)     → i2s_driver_install(RX+TX) → i2s_set
 ```
 `ds=0` = IDLE, `ds=1` = LISTENING, `ds=2` = THINKING, `ds=3` = TALKING。双核计数器持续增长 = 系统健康；某一侧停滞 = 对应核心卡死，结合 WARN 日志定位。
 
-**架构演进计划（flush_skip 消除 + 任务拆分）**：
+**架构技术债（Phase 6 待消除）**：
 
-当前架构的核心技术债：THINKING 期间 `flush_skip=true` 冻结整个 LVGL 渲染，Thinking 动画完全不播放。这个 hack 源于担心 SPI 刷屏与 WiFi I/O 争夺 Core 0 CPU，但它本身引发了 LVGL 无限重绘循环 bug，又用"skip 期间跳过 `lv_timer_handler()`"来修，层层补丁。
+THINKING 期间 `flush_skip=true` 冻结整个 LVGL 渲染，Thinking 动画不播放。这个 hack 虽然修好了 LVGL 无限重绘 bug，但层层补丁。Phase 6 计划删除 flush_skip，并拆为 4 个 FreeRTOS Task（LVGL / State Machine / Audio / Cloud），用 Queue 替代 volatile flag，详见 Phase 6 待办。
 
-**分两步消除：**
+### Phase 5: 后端服务 - "给猫装上大脑" (已完成 2026-04-11)
 
-| 步骤 | 改动 | 风险 | 收益 |
-|------|------|------|------|
-| **Phase 4 收尾** | 删除 `flush_skip` / `touch_skip` 机制，LVGL 在 THINKING/TALKING 期间正常渲染 | 低——改动小，WiFi 上传可能慢 1-2s（SPI 占 Core 0 ~6%） | Thinking 动画流畅，消灭整个 skip mode 补丁栈 |
-| **Phase 5 重构** | 配合后端统一接口，拆为 4 个 FreeRTOS Task（见下），用 Queue 替代 volatile flag | 中——改动大，但后端接口也变了，一起改更合理 | 架构清晰，为 barge-in 等高级功能留空间 |
+**目标**：在腾讯云服务器上搭建 Python 后端，ESP32 作为薄客户端只调一个接口
 
-**Phase 5 目标架构（4 个 FreeRTOS Task）**：
-
-```
-Core 0 ─────────────────────────────────────
-  LVGL Task (prio 5)
-    - 永远跑 lv_timer_handler()，16ms 间隔
-    - 消费 Queue 中的表情/字幕更新命令
-    - 永不冻结，无 skip mode
-
-Core 1 ─────────────────────────────────────
-  State Machine Task (prio 3)  ← 替代现在的 Arduino loop()
-    - 管理 IDLE/LISTENING/THINKING/TALKING 状态
-    - 向 Audio/Cloud Task 发 Queue 命令，等待结果
-
-  Audio Task (prio 8, 实时优先)
-    - I2S 录音 + VAD（独立，不被 HTTP 阻塞）
-    - I2S TTS 播放
-    - 通过 Queue 返回录音完成/播放完成事件
-
-  Cloud Task (prio 3)
-    - Phase 4: STT → LLM → TTS 三次 HTTP（兼容当前）
-    - Phase 5: POST /chat(PCM) → {text, emotion, audio_url}
-    - 通过 Queue 返回结果
-```
-
-**核心收益**：
-
-| 问题 | 现在 | 改后 |
-|------|------|------|
-| LVGL 在 THINKING 冻结 | 是（flush_skip 暂停渲染） | 消除，Thinking 动画流畅 |
-| flush_skip 补丁栈 | 需要（skip + lock barrier + touch_skip） | 完全删除 |
-| 跨核通信 | 多个裸 volatile flag | FreeRTOS Queue，类型安全 |
-| Audio 被 HTTP 延迟 | 当前串行无影响，但无法做 barge-in | Audio Task 独立高优先，可扩展 |
-
-### Phase 5: Multi-Agent 后端 - "给猫装上大脑"
-
-**目标**：在腾讯云服务器上搭建 Python 后端，管理多 Agent 和记忆
-
-**服务器**：腾讯云 `122.51.129.89`，Ubuntu 24.04 LTS，Python 3.12，SSH root 可直连
+**服务器**：腾讯云 `122.51.129.89`，Ubuntu 24.04 LTS，Python 3.12，部署路径 `/opt/cybercat/`
 
 ```mermaid
 graph TD
-    ESP["ESP32-S3 板子"] -->|"POST /chat (音频)"| API["Python FastAPI 后端\n腾讯云 122.51.129.89"]
-    API --> STT_svc["STT: Whisper/讯飞"]
-    STT_svc -->|"转写文字"| Orchestrator["Agent 编排器"]
-    Orchestrator --> ConvAgent["对话 Agent (猫猫人设)"]
-    Orchestrator --> MoodAgent["情绪 Agent"]
-    Orchestrator --> MemAgent["记忆 Agent"]
-    ConvAgent -->|"查询记忆"| MemAgent
-    MoodAgent -->|"分析情绪"| Orchestrator
-    Orchestrator -->|"回复+情绪"| TTS_svc["TTS: Edge-TTS/讯飞"]
-    TTS_svc -->|"音频+表情指令"| ESP
+    ESP["ESP32-S3 板子"] -->|"POST /chat (裸 WAV)"| API["FastAPI 后端\n122.51.129.89:8000"]
+    API --> STT_svc["STT: SiliconFlow SenseVoice"]
+    STT_svc -->|"转写文字"| MEM["记忆检索\nSQLite"]
+    MEM -->|"注入记忆+历史"| LLM["LLM: MiniMax-M2.5\n(DashScope)"]
+    LLM -->|"AI 回复"| EMO["情绪分析\n(规则匹配)"]
+    LLM -->|"AI 回复"| TTS_svc["TTS: SiliconFlow CosyVoice2"]
+    TTS_svc -->|"audio_url"| API
+    EMO -->|"emotion"| API
+    API -->|"{text_reply, emotion, audio_url}"| ESP
+    ESP -->|"GET audio_url"| TTS_svc2["静态文件\n/tts/*.wav"]
 ```
 
-- [ ] **对话 Agent**：带猫猫人设的 LLM 对话（"我是一只傲娇的猫，喵~"）
-- [ ] **情绪 Agent**：分析对话内容，返回情绪状态（neutral/happy/sleepy/talking）
-- [ ] **记忆 Agent**：提取关键信息（用户名字、偏好、重要事件），长期存储
-- [ ] SQLite 做记忆数据库
-- [ ] 暴露 REST API：`POST /chat` 接收音频，返回 JSON（含回复文字 + 情绪标签 + 音频 URL）
-- [ ] 部署到腾讯云（uvicorn + systemd 守护进程）
-- [ ] **设备端重构**：拆为 4 个 FreeRTOS Task（LVGL / State Machine / Audio / Cloud），删除 flush_skip 机制，volatile flag → Queue（见 Phase 4 架构演进计划）
+- [x] **`POST /chat` 统一接口**：ESP32 POST 裸 WAV → 后端串联 STT→LLM→TTS → 返回 JSON（`text_reply` + `emotion` + `audio_url`）
+- [x] **对话服务**：猫猫人设 system prompt（"赛博喵"），MiniMax-M2.5 via DashScope，注入记忆和对话历史
+- [x] **情绪分析**：规则匹配（`happy`/`thinking`/`neutral`），后端 emotion 字段驱动猫脸表情
+- [x] **记忆模块**：SQLite 短期对话历史（最近 10 轮）+ LLM 定期提取长期记忆摘要
+- [x] **TTS 音频服务**：WAV 缓存为静态文件，UUID 文件名直链，1 小时自动清理
+- [x] **部署**：uvicorn + systemd 守护进程（`cybercat-backend.service`），开机自启
+- [x] **设备端对接**：`#ifdef BACKEND_URL` 条件编译，`secrets.h` 注释掉即回退 Phase 4 直连模式
+
+**HTTP 合约**：
+
+```
+POST /chat
+Content-Type: audio/wav
+X-Session-ID: <ESP32 MAC 地址>
+Body: 裸 WAV 字节（44 字节头 + 16-bit PCM, 16kHz mono）
+
+→ 200 OK
+{
+  "text_reply": "喵～听到了听到了！有什么想聊的吗？🐱",
+  "emotion": "happy",
+  "audio_url": "http://122.51.129.89:8000/tts/b9544fd9...1b.wav"
+}
+```
+
+**emotion 可选值**：
+
+| 值 | 猫脸表情 | 触发条件 |
+|----|----------|----------|
+| `happy` | `CAT_HAPPY` 眯眼 | 回复含 `!` `~` `哈哈` `喵喵` 等 |
+| `thinking` | `CAT_THINKING` 沉思 | 回复含 `嗯` `也许` `可能` `让我想想` 等 |
+| `neutral` | `CAT_NEUTRAL` | 默认 |
+| `talking` | `CAT_TALKING` 律动 | fallback |
+
+**技术栈**：
+
+| 层 | 选型 |
+|----|------|
+| Web 框架 | FastAPI + uvicorn |
+| STT | SiliconFlow `FunAudioLLM/SenseVoiceSmall` |
+| LLM | MiniMax-M2.5（阿里云 DashScope OpenAI 兼容接口）|
+| TTS | SiliconFlow `FunAudioLLM/CosyVoice2-0.5B:anna`（温柔女声）|
+| 记忆 | SQLite（`sessions` 短期 + `long_term_memory` 长期）|
+
+**记忆管理策略**：
+- 短期记忆：每轮对话自动保存到 `sessions` 表，LLM 注入最近 10 轮历史
+- 长期记忆：每 5 轮对话用 LLM 从历史中提取关键信息（用户名字、喜好、重要事件），更新 `long_term_memory` 表
+- LLM system prompt 自动注入记忆摘要：`[关于用户的记忆：{summary}]`
+
+**设备端对接（`cloud_client.cpp`）**：
+
+`_sttWorkerTask` 通过 `#ifdef BACKEND_URL` 分支：
+1. 在 PSRAM 中拼装 44 字节 WAV 头 + PCM，POST 到 `{BACKEND_URL}/chat`（plain HTTP，`WiFiClient`）
+2. 解析 JSON 三字段，`emotion` 存入 `_emotion[32]`，`audio_url` 存入 `_audioUrl[256]`
+3. `_doTts()` 检测到 `_audioUrl` 非空时，调用 `_downloadAndPlayWav()` 下载并播放
+4. `main.cpp` 中 `emotionToExpr()` 将 emotion 映射为 `CatExpression`，传入 `enterTalking(reply, expr)`
+
+**端到端实测日志**：
+```
+[Cloud] Backend POST http://122.51.129.89:8000/chat (143084 bytes WAV)
+[Cloud] Backend response: {"text_reply":"喵~听到了！","emotion":"happy","audio_url":"http://..."}
+[Cloud] Downloading TTS WAV: http://122.51.129.89:8000/tts/b9544fd9...wav
+[Cloud] TTS WAV downloaded 125532 bytes
+[ES8311] play: 16000Hz 1ch 16bit, 125488 bytes PCM
+[ES8311] play loop done in 3823ms
+```
+
+**已知限制**：
+- Backend 模式下 `[你]` 用户字幕不显示（后端 `/chat` 不单独返回 transcript，只返回 AI 回复），仅显示 `[猫]` AI 回复
+- 情绪分析为简单规则匹配，未来可升级为 LLM 分类
+- HTTP 明文通信（后端为私有服务器，初期可接受；生产环境需 nginx + TLS）
 
 ### Phase 6: 集成与打磨 - "让猫活起来"
 
-- [ ] ESP32 端主循环状态机（待机 -> 听 -> 思考 -> 说 -> 待机）
-- [ ] 表情与语音同步（说话时眼睛律动，开心时眼睛弯成月牙）
-- [ ] 待机时随机行为（眨眼、打哈欠、摇尾巴、看来看去）
+- [x] ESP32 端主循环状态机（IDLE → LISTENING → THINKING → TALKING → IDLE）
+- [x] 表情与语音同步（说话时眼睛律动，后端 emotion 驱动表情）
+- [x] 待机时随机行为（眨眼、看向，120s 无操作进入 Sleepy）
+- [ ] 删除 `flush_skip` / `touch_skip` 机制，让 LVGL 在 THINKING/TALKING 期间正常渲染
+- [ ] 设备端重构：拆为 4 个 FreeRTOS Task（LVGL / State Machine / Audio / Cloud），volatile flag → Queue
+- [ ] 后端 `/chat` 增加 `transcript` 字段，修复 Phase 5 模式下 `[你]` 用户字幕不显示
+- [ ] 情绪分析升级为 LLM 分类（替代规则匹配）
+- [ ] 字幕出现/消失动画（渐显渐隐或滑入滑出）
+- [ ] 音量旋钮控制播放音量
 - [ ] 开机动画（猫从睡梦中醒来）
 - [ ] 优化延迟（录音结束到开始回复的时间）
 - [ ] 错误处理：WiFi 断连恢复、API 超时重试
 - [ ] 低电量提示表情
 - [ ] QMI8658 陀螺仪：摇晃触发晕眩表情
+- [ ] HTTPS 通信（nginx + TLS 证书，替代当前 HTTP 明文）
 
 ## 当前代码结构
 
@@ -515,7 +557,7 @@ cyber_cat/
     audio_input.h/.cpp      -- I2S 麦克风录音 + VAD（遗留 I2S 驱动，全双工 RX+TX）
     es7210_mic.h/.cpp       -- ES7210 音频 ADC I2C 初始化（V2 板麦克风编解码器）
     es8311_spk.h/.cpp       -- ES8311 音频 DAC I2C 初始化 + WAV 播放（mono→stereo，PA 控制）+ 音量控制 + beep 自检
-    cloud_client.h/.cpp     -- 云端 HTTP 通信：STT 上传 + LLM chat + TTS 下载播放（异步 FreeRTOS task，Core 1）
+    cloud_client.h/.cpp     -- 云端通信：Phase 5 统一后端 / Phase 4 直连（STT+LLM+TTS），`#ifdef BACKEND_URL` 切换
     chat_ticker.h/.cpp      -- 屏幕底部 CJK 对话条幅（[你]/[猫]，含 emoji 过滤）
     lv_font_chinese_16.c    -- 自定义 CJK 字体（GB2312 一级 3766 字 + ASCII + 标点，4bpp 16px，lv_font_conv 生成）
     wifi_manager.h/.cpp     -- WiFi 连接管理
@@ -529,16 +571,24 @@ cyber_cat/
       I2C_Driver.h/.cpp       -- I2C 通信封装
       LVGL_Driver.h/.cpp      -- LVGL 对接层（含 skip mode 渲染暂停 + update callback + 心跳计数器 + 超时 guard）
 
-  backend/                  -- Python 后端（Phase 5，部署到腾讯云 122.51.129.89）
-    main.py                 -- FastAPI 入口
-    agents/                 -- 对话/情绪/记忆 Agent
-    memory/                 -- SQLite 记忆存储
-    requirements.txt        -- Python 依赖
+cyber_cat_backend/            -- Python 后端（Phase 5，部署到腾讯云 122.51.129.89:8000）
+  main.py                     -- FastAPI 入口（/chat + /health + TTS 缓存清理）
+  services/
+    stt.py                    -- SiliconFlow SenseVoice 语音转文字
+    llm.py                    -- DashScope LLM 对话生成 + 记忆提取
+    tts.py                    -- SiliconFlow CosyVoice2 文字转语音
+    emotion.py                -- 情绪分析（规则匹配）
+  memory/
+    database.py               -- SQLite 数据库初始化
+    repository.py             -- 短期/长期记忆读写（sessions + long_term_memory）
+  requirements.txt            -- Python 依赖
+  cybercat-backend.service    -- systemd 守护进程配置
+  .env.example                -- 环境变量模板（API Key 等）
 ```
 
 ## 开发顺序
 
-严格按 **Phase 1 -> 2 -> 3 -> 4 -> 5 -> 6** 顺序推进，每个阶段都能独立验证。
+严格按 **Phase 1 -> 2 -> 3 -> 4 -> 5 -> 6** 顺序推进，每个阶段都能独立验证。Phase 1–5 已全部完成，Phase 6 为持续打磨。
 
 ## 常用命令
 

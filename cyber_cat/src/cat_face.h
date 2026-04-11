@@ -27,6 +27,11 @@ public:
     uint32_t lastInteractMs() const { return _lastTouchMs; }
     void update();
 
+    // Drowsy transition: slowly shrinks eye height toward 20px over 3000ms.
+    // Called at the 90s idle mark; setExpression(CAT_SLEEPY) follows at 120s.
+    // No-op if already SLEEPY or in an active dialog expression.
+    void startDrowsy();
+
     void onLongPress(LongPressCb cb) { _longPressCb = cb; }
     void onTap(TapCb cb)             { _tapCb = cb; }
 
@@ -45,7 +50,9 @@ private:
     CatExpression _baseExpr = CAT_NEUTRAL;
 
     uint8_t  _animEpoch   = 0;         // incremented on each _apply(); guards stale done-callbacks
-    int32_t  _blinkFactor = 0;         // 0 = open, 1000 = closed
+    int32_t  _blinkFactor  = 0;        // 0 = open, 1000 = closed
+    int32_t  _breathFactor = 0;        // 0 = -2px, 1000 = +2px (Neutral breathing rhythm)
+    int32_t  _drowsyH      = -1;       // current eye h override during drowsy transition (-1 = inactive)
 
     int16_t  _lookDX = 0, _lookDY = 0;
     int16_t  _lookTgtDX = 0, _lookTgtDY = 0;
@@ -67,6 +74,7 @@ private:
     void _render();
     void _scheduleBlink();
     void _scheduleLook();
+    void _scheduleBreath();
 
     void _startTalking(uint32_t initialDelay = 0);
     void _stopTalking();
@@ -79,6 +87,8 @@ private:
     static void _blinkDoneCb(lv_anim_t *a);
     static void _lookAnimCb(void *var, int32_t v);
     static void _lookDoneCb(lv_anim_t *a);
+    static void _breathAnimCb(void *var, int32_t v);
+    static void _drowsyAnimCb(void *var, int32_t v);
     static void _talkExecCbL(void *var, int32_t t);
     static void _talkExecCbR(void *var, int32_t t);
     static void _talkDoneCb(lv_anim_t *a);

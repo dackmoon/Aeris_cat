@@ -31,6 +31,8 @@
 #define LOOK_HOLD_DUR    1000
 #define LISTEN_PULSE_CLOSE 150   // Listening: subtle eye pulse (not a full blink)
 #define LISTEN_PULSE_OPEN  200
+#define BREATH_HALF_DUR  1750    // Neutral breathing: half-period (inhale or exhale)
+#define DROWSY_DUR       3000    // startDrowsy(): eye shrink animation duration
 
 // ==========================================================
 //  Talking — 4-stage squeeze/unsquash loop
@@ -57,14 +59,14 @@ static const CatFace::EyeState TALK_BASE_R = {EYE_R_X, EYE_Y, EYE_D, EYE_D, 0};
 // Stage table — row order matches stage index 0-3
 // rot unit: 0.1 degrees (LVGL convention)
 static const TalkStage TALK_STAGES[4] = {
-    // Stage 0: squeeze — flatten & tilt inward, lift up
-    { {EYE_L_X, (int16_t)(EYE_Y - 10), 100, 60,  100},
-      {EYE_R_X, (int16_t)(EYE_Y - 10), 100, 60, -100},
+    // Stage 0: squeeze — flatten, lift up (no rotation — LVGL transform broken)
+    { {EYE_L_X, (int16_t)(EYE_Y - 10), 100, 60, 0},
+      {EYE_R_X, (int16_t)(EYE_Y - 10), 100, 60, 0},
       100, lv_anim_path_ease_out },
 
     // Stage 1: unsquash — expand back beyond neutral, settle down
-    { {EYE_L_X, (int16_t)(EYE_Y + 10), 95, 95,  50},
-      {EYE_R_X, (int16_t)(EYE_Y + 10), 95, 95, -50},
+    { {EYE_L_X, (int16_t)(EYE_Y + 10), 95, 95, 0},
+      {EYE_R_X, (int16_t)(EYE_Y + 10), 95, 95, 0},
       150, lv_anim_path_ease_out },
 
     // Stage 2: overshoot — very slightly larger, fully upright
@@ -132,6 +134,22 @@ void CatFace::_render() {
 
     EyeState rL = _baseL;
     EyeState rR = _baseR;
+
+    // Neutral breathing: ±2px size pulse mapped from _breathFactor [0,1000]
+    // factor=0 → -2px, factor=500 → 0px, factor=1000 → +2px
+    if (_cur == CAT_NEUTRAL && _breathFactor >= 0) {
+        int16_t bd = (int16_t)(_breathFactor * 4 / 1000 - 2); // -2..+2
+        rL.w = (int16_t)(rL.w + bd);
+        rL.h = (int16_t)(rL.h + bd);
+        rR.w = (int16_t)(rR.w + bd);
+        rR.h = (int16_t)(rR.h + bd);
+    }
+
+    // Drowsy override: replaces eye height during the 90s→120s transition
+    if (_drowsyH >= 0) {
+        rL.h = (int16_t)_drowsyH;
+        rR.h = (int16_t)_drowsyH;
+    }
 
     if (_blinkFactor > 0) {
         if (_cur == CAT_HAPPY) {
@@ -231,10 +249,10 @@ void CatFace::_lookDoneCb(lv_anim_t *a) {
 void CatFace::_scheduleLook() {
     if (_cur == CAT_HAPPY || _cur == CAT_TALKING || _cur == CAT_LISTENING) return;
 
-    // Thinking: reduced amplitude — eyes drift slightly, not widely
+    // Thinking: reduced X amplitude + upward Y bias (simulates looking up while pondering)
     bool thinking = (_cur == CAT_THINKING);
     _lookTgtDX = (int16_t)rng(thinking ? -4 : -8, thinking ? 5 : 9);
-    _lookTgtDY = (int16_t)rng(thinking ? -3 : -5, thinking ? 4 : 6);
+    _lookTgtDY = (int16_t)rng(thinking ? -8 : -5, thinking ? -2 : 6);
 
     lv_anim_t a;
     lv_anim_init(&a);
@@ -304,9 +322,11 @@ void CatFace::_talkDoneCb(lv_anim_t *a) {
     if ((uintptr_t)lv_anim_get_user_data(a) != self->_animEpoch) return;
     if (self->_talkStage < 0) return;
 
-    // Advance to next stage (wrap 3 → 0 for infinite loop)
+    // Advance to next stage (wrap 3 → 0 for infinite loop).
+    // Small random jitter gives the rhythm an organic feel.
     int8_t next = (self->_talkStage + 1) % 4;
-    self->_startTalkStage(next);
+    uint32_t jitter = (uint32_t)rng(0, 25);
+    self->_startTalkStage(next, jitter);
 }
 
 void CatFace::_startTalkStage(int stage, uint32_t delay) {
@@ -351,6 +371,69 @@ void CatFace::_stopTalking() {
 }
 
 // ==========================================================
+//  Neutral breathing rhythm — ±2px size pulse
+// ==========================================================
+void CatFace::_breathAnimCb(void *var, int32_t v) {
+    CatFace *self = (CatFace *)var;
+    if (self->_cur != CAT_NEUTRAL) return;
+    self->_breathFactor = v;
+    self->_render();
+}
+
+void CatFace::_scheduleBreath() {
+    if (_cur != CAT_NEUTRAL) return;
+
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, this);
+    lv_anim_set_values(&a, 0, 1000);
+    // One half-period: 0→1000 (exhale), then 1000→0 (inhale) via playback
+    lv_anim_set_duration(&a, BREATH_HALF_DUR);
+    lv_anim_set_reverse_duration(&a, BREATH_HALF_DUR);
+    lv_anim_set_path_cb(&a, lv_anim_path_ease_in_out);
+    lv_anim_set_exec_cb(&a, _breathAnimCb);
+    lv_anim_set_repeat_count(&a, LV_ANIM_REPEAT_INFINITE);
+    lv_anim_start(&a);
+}
+
+// ==========================================================
+//  Drowsy transition — gradual eye shrink before SLEEPY
+// ==========================================================
+void CatFace::_drowsyAnimCb(void *var, int32_t v) {
+    CatFace *self = (CatFace *)var;
+    // _apply() resets _drowsyH to -1 before deleting the animation.
+    // Guard against any stale callback that fires in the same LVGL tick.
+    if (self->_drowsyH < 0) return;
+    self->_drowsyH = (int16_t)v;
+    self->_render();
+}
+
+void CatFace::startDrowsy() {
+    // Skip if already asleep or in an active dialog expression
+    if (_cur == CAT_SLEEPY   || _cur == CAT_TALKING  ||
+        _cur == CAT_THINKING || _cur == CAT_LISTENING) return;
+    // Skip if drowsy already started
+    if (_drowsyH >= 0) return;
+
+    // Cancel breath so the size change doesn't fight the h override
+    lv_anim_delete(this, _breathAnimCb);
+    _breathFactor = 0;
+
+    int16_t currentH = _baseL.h; // current rendered eye height from last lerp
+    if (currentH <= 20) return;  // already small enough
+
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, this);
+    lv_anim_set_user_data(&a, (void *)(uintptr_t)_animEpoch);
+    lv_anim_set_values(&a, currentH, 20);
+    lv_anim_set_duration(&a, DROWSY_DUR);
+    lv_anim_set_path_cb(&a, lv_anim_path_ease_in);
+    lv_anim_set_exec_cb(&a, _drowsyAnimCb);
+    lv_anim_start(&a);
+}
+
+// ==========================================================
 //  Apply expression — starts smooth morph animation
 // ==========================================================
 void CatFace::_apply(CatExpression e) {
@@ -359,9 +442,13 @@ void CatFace::_apply(CatExpression e) {
     lv_anim_delete(this, _exprAnimCb);
     lv_anim_delete(this, _blinkAnimCb);
     lv_anim_delete(this, _lookAnimCb);
+    lv_anim_delete(this, _breathAnimCb);
+    lv_anim_delete(this, _drowsyAnimCb);
 
     _animEpoch++;
-    _blinkFactor = 0;
+    _blinkFactor  = 0;
+    _breathFactor = 0;
+    _drowsyH      = -1;
     _lookDX = 0;
     _lookDY = 0;
 
@@ -377,8 +464,9 @@ void CatFace::_apply(CatExpression e) {
         break;
 
     case CAT_HAPPY:
-        _stL = {EYE_L_X, (int16_t)(EYE_Y - 5), 95, 55, 0};
-        _stR = {EYE_R_X, (int16_t)(EYE_Y - 5), 95, 55, 0};
+        // Squished crescent — wide, short, lifted up (smile-eye arc without rotation)
+        _stL = {EYE_L_X, (int16_t)(EYE_Y - 8), 105, 38, 0};
+        _stR = {EYE_R_X, (int16_t)(EYE_Y - 8), 105, 38, 0};
         break;
 
     case CAT_LISTENING:
@@ -389,10 +477,9 @@ void CatFace::_apply(CatExpression e) {
         break;
 
     case CAT_THINKING:
-        // Slightly narrowed + outward-shifted + subtle tilt
-        // Conveys "eyes unfocused, gazing into the distance"
-        _stL = {(int16_t)(EYE_L_X - 2), EYE_Y, 88, 78, -50};
-        _stR = {(int16_t)(EYE_R_X + 2), EYE_Y, 88, 78,  50};
+        // Slightly narrowed + outward-shifted — no rotation (LVGL transform broken)
+        _stL = {(int16_t)(EYE_L_X - 3), (int16_t)(EYE_Y + 2), 85, 72, 0};
+        _stR = {(int16_t)(EYE_R_X + 3), (int16_t)(EYE_Y + 2), 85, 72, 0};
         break;
 
     case CAT_SLEEPY:
@@ -427,6 +514,7 @@ void CatFace::_apply(CatExpression e) {
 
     _scheduleBlink();
     _scheduleLook();
+    _scheduleBreath();
 }
 
 // ==========================================================

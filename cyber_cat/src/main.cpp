@@ -16,8 +16,9 @@
 // ============================================================
 //  Constants
 // ============================================================
-#define IDLE_TIMEOUT_MS     120000UL
-#define THINKING_TIMEOUT_MS  20000UL
+#define IDLE_TIMEOUT_MS      120000UL   // full SLEEPY at 120s
+#define IDLE_DROWSY_MS        90000UL   // startDrowsy() at 90s
+#define THINKING_TIMEOUT_MS   20000UL
 
 // ============================================================
 //  Dialog state machine
@@ -223,10 +224,14 @@ static void lvglUpdateCb() {
     }
 
     if (dialogState == DIALOG_IDLE &&
-        catFace.getExpression() != CAT_SLEEPY &&
-        (millis() - catFace.lastInteractMs()) >= IDLE_TIMEOUT_MS) {
-        Serial.println("[UI] Idle timeout -> Sleepy");
-        catFace.setExpression(CAT_SLEEPY);
+        catFace.getExpression() != CAT_SLEEPY) {
+        uint32_t idleMs = millis() - catFace.lastInteractMs();
+        if (idleMs >= IDLE_TIMEOUT_MS) {
+            Serial.println("[UI] Idle timeout -> Sleepy");
+            catFace.setExpression(CAT_SLEEPY);
+        } else if (idleMs >= IDLE_DROWSY_MS) {
+            catFace.startDrowsy();
+        }
     }
 }
 
