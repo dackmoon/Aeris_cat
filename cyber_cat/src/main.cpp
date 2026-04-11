@@ -282,16 +282,7 @@ void setup() {
     lvgl_port_unlock();
 
     Serial.println("[5/6] WiFi & Cloud...");
-    static const WifiNetwork wifiNetworks[] = {
-        { WIFI_SSID_1, WIFI_PASS_1 },
-#ifdef WIFI_SSID_2
-        { WIFI_SSID_2, WIFI_PASS_2 },
-#endif
-#ifdef WIFI_SSID_3
-        { WIFI_SSID_3, WIFI_PASS_3 },
-#endif
-    };
-    wifiInit(wifiNetworks, sizeof(wifiNetworks) / sizeof(wifiNetworks[0]));
+    wifiInit(WIFI_SSID, WIFI_PASS);
     cloud.begin(LLM_API_KEY, LLM_API_BASE, LLM_MODEL,
                 STT_API_KEY, STT_API_BASE,
                 TTS_API_KEY, TTS_API_BASE, TTS_MODEL, TTS_VOICE);
