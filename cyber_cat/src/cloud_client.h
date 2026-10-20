@@ -2,6 +2,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <atomic>
+#include <freertos/FreeRTOS.h>
 
 enum CloudState {
     CLOUD_IDLE,
@@ -39,7 +40,21 @@ public:
 
     void consume();
 
+    // Abandon the in-flight request. A running worker cannot be interrupted
+    // mid-HTTP, so it keeps running but its result is discarded and the state
+    // returns to CLOUD_IDLE when it finishes; TTS playback stops immediately.
+    // New send*() calls are rejected until then (see isBusy()).
+    void cancel();
+    bool isBusy() const;
+
+    // Backend memory session: "<MAC>" by default, "<prefix>-<MAC>" when set
+    // (keeps test traffic out of the cat's real conversation history).
+    void setSessionPrefix(const char *prefix);
+
 private:
+    void _finish(CloudState s);
+    void _setProgress(CloudState s);
+
     static void _chatWorkerTask(void *param);
     static void _sttWorkerTask(void *param);
     static void _ttsWorkerTask(void *param);
@@ -61,6 +76,8 @@ private:
     const char *_ttsVoice   = nullptr;
 
     std::atomic<CloudState> _state{CLOUD_IDLE};
+    std::atomic<bool>       _cancelled{false};
+    portMUX_TYPE            _mux = portMUX_INITIALIZER_UNLOCKED;
 
     char    *_response    = nullptr;
     char    *_errMsg      = nullptr;
@@ -68,6 +85,7 @@ private:
     char    *_pendingMsg  = nullptr;
     char     _emotion[32]  = {};   // Phase 5: emotion tag from backend
     char     _audioUrl[256] = {};  // Phase 5: TTS audio URL from backend
+    char     _sessionPrefix[16] = {};
 
     uint8_t *_pendingPcm   = nullptr;
     size_t   _pendingBytes = 0;

@@ -94,7 +94,20 @@ bool es8311Init(uint32_t sampleRate) {
 //  Mono samples are duplicated L→R for the stereo I2S bus.
 //  Runs entirely inside the caller's task (blocking).
 // =============================================================
-bool es8311Play(const uint8_t *wavData, size_t wavBytes) {
+// Frames queued in the I2S DMA ring (dma_buf_count × dma_buf_len in audio_input.cpp)
+// play out after i2s_write() returns; the published level is delayed to match.
+static const size_t DMA_QUEUED_FRAMES = 8 * 256;
+
+static std::atomic<uint16_t> s_playLevel{0};
+static std::atomic<bool>     s_silent{false};
+static bool                  s_aborted = false;
+
+uint16_t es8311GetPlayLevel()        { return s_playLevel.load(); }
+void     es8311SetSilent(bool silent) { s_silent = silent; }
+bool     es8311WasAborted()          { return s_aborted; }
+
+bool es8311Play(const uint8_t *wavData, size_t wavBytes, const std::atomic<bool> *abort) {
+    s_aborted = false;
     if (!wavData || wavBytes < 44) {
         Serial.println("[ES8311] play: invalid WAV");
         return false;
@@ -147,12 +160,21 @@ bool es8311Play(const uint8_t *wavData, size_t wavBytes) {
     i2s_zero_dma_buffer(I2S_PORT);
 
     // Enable PA
-    digitalWrite(PA_CTRL_PIN, HIGH);
+    if (!s_silent) digitalWrite(PA_CTRL_PIN, HIGH);
     delay(10);  // allow NS4150B to ramp up
+
+    static const size_t LEVEL_DELAY = DMA_QUEUED_FRAMES / FRAMES;
+    uint16_t levelRing[LEVEL_DELAY + 1] = {};
+    size_t   levelIdx = 0;
 
     uint32_t t0 = millis();
     bool ok = true;
     while (srcIdx < numSrcSamples) {
+        if (abort && abort->load()) {
+            s_aborted = true;
+            Serial.println("[ES8311] play aborted");
+            break;
+        }
         // How many source frames can we grab this chunk?
         size_t srcFrames;
         if (channels == 1) {
@@ -169,6 +191,17 @@ bool es8311Play(const uint8_t *wavData, size_t wavBytes) {
             memcpy(stereoBuf, &src[srcIdx], srcFrames * 4);
         }
         if (srcFrames == 0) break;
+
+        {
+            int64_t sum = 0;
+            for (size_t i = 0; i < srcFrames; i++) {
+                int32_t s = stereoBuf[i * 2];
+                sum += s * s;
+            }
+            levelRing[levelIdx % (LEVEL_DELAY + 1)] = (uint16_t)sqrtf((float)(sum / (int64_t)srcFrames));
+            s_playLevel = levelRing[(levelIdx + 1) % (LEVEL_DELAY + 1)];
+            levelIdx++;
+        }
 
         // Write with full retry loop — partial writes must not silently drop data
         size_t toWrite = srcFrames * 4;
@@ -202,12 +235,15 @@ bool es8311Play(const uint8_t *wavData, size_t wavBytes) {
     Serial.printf("[ES8311] play loop done in %ums (expected ~%ums)\n",
                   elapsed, (unsigned)(pcmBytes * 1000UL / (sampleRate * 2)));
 
-    // Let I2S DMA drain before muting PA (avoids pop)
+    // Let I2S DMA drain before muting PA (avoids pop). After an abort the queued
+    // tail is cleared instead of being played out.
+    if (s_aborted) i2s_zero_dma_buffer(I2S_PORT);
     vTaskDelay(pdMS_TO_TICKS(80));
     digitalWrite(PA_CTRL_PIN, LOW);
+    s_playLevel = 0;
 
     heap_caps_free(stereoBuf);
-    return ok;
+    return ok || s_aborted;
 }
 
 // =============================================================

@@ -10,17 +10,26 @@
 ## 构建 & 运行
 
 ```bash
-cd /Users/weizhong.wang/Workspace/ESP-S3/lvgl_sim
+# 首次：拉取 LVGL 子模块（与固件同为 v9.3.0）+ 安装依赖
+cd Aeris_cat && git submodule update --init lvgl
+brew install sdl2 cmake ninja
 
-# 首次配置（只需一次）
-cmake -B build -G "Ninja Multi-Config" \
-  -DLV_BUILD_CONF_PATH=/Users/weizhong.wang/Workspace/ESP-S3/lvgl/lv_conf.h
+cd lvgl_sim
+# 首次配置（只需一次）；lv_conf.h 由 CMakeLists.txt 指向本目录
+cmake -B build -G "Ninja Multi-Config"
 
 # 每次改代码后重新编译
 cmake --build build --config Release
 
 # 启动模拟器
 ./build/Release/lvgl_sim
+
+# 截图模式：渲染 9 种状态拼成 grid.ppm 后退出（可选第二个参数为装饰掩码）
+./build/Release/lvgl_sim --shots /tmp/catshots [decor]
+sips -s format png /tmp/catshots/grid.ppm --out grid.png
+
+# 装饰层对比：无 / 瞳孔 / 瞳孔+腮红 / 全部，各 5 种状态 → decor.ppm
+./build/Release/lvgl_sim --decor-shots /tmp/catshots
 ```
 
 ---
@@ -36,7 +45,7 @@ lvgl_sim/
     └── Touch_CST816.h         # 桌面 stub：GESTURE 枚举 + touch_data 全局变量
 
 # 直接引用（不复制）：
-../lvgl/                       # LVGL 源码库（v9.5+，master 分支）
+../lvgl/                       # LVGL 源码库（git 子模块，锁定 v9.3.0，与固件一致）
 ../cyber_cat/src/cat_face.cpp  # 真实固件代码，零修改直接编译
 ../cyber_cat/src/cat_face.h
 ```
@@ -47,14 +56,13 @@ lvgl_sim/
 
 | 键 | 效果 |
 |----|------|
-| `1` | CAT_NEUTRAL（呼吸律动） |
-| `2` | CAT_HAPPY（宽扁眯眼） |
-| `3` | CAT_LISTENING（放大不对称） |
-| `4` | CAT_THINKING（仰视外移） |
-| `5` | CAT_SLEEPY（细线） |
-| `6` | CAT_TALKING（律动循环） |
-| `Space` | 模拟点击手势（→ Happy 2s） |
-| `H` | 模拟长按手势（触发 onLongPress） |
+| `1`–`5` | Activity：Idle / Listening / Thinking / Talking / Sleeping |
+| `Q W E R T` | Mood：Neutral / Happy / Curious / Confused / Surprised |
+| `Y` / `U` | 闪现 Surprised 0.4s / Confused 1.5s |
+| `D` | 装饰层循环：无 → 瞳孔 → 瞳孔+腮红 → 全部 |
+| `V` | 开关合成语音电平（驱动 Listening 放大、Talking 律动） |
+| `Z` | 开关犯困渐变（6s 从清醒到最困，仅 Idle） |
+| 鼠标按住 | 模拟手指按在屏幕上（眼睛微压、视线跟随） |
 | `ESC` | 退出 |
 
 ---
@@ -80,6 +88,8 @@ CMake include 优先级：`mock/` > `cyber_cat/src/` > `lvgl/`，确保 mock 头
 | `LV_USE_SDL` | `1` | 启用 SDL2 显示驱动 |
 | `LV_SDL_INCLUDE_PATH` | `<SDL.h>` | Homebrew SDL2 include 路径为 `/opt/homebrew/include/SDL2/`，用 `<SDL.h>` 避免双层目录问题 |
 | `LV_USE_DEMO_WIDGETS` | `1` | 启用 widget demo（可选） |
+| `LV_USE_STDLIB_MALLOC` | `LV_STDLIB_CLIB` | 用系统 malloc；内置 64KB 池放不下整屏截图缓冲 |
+| `LV_USE_SNAPSHOT` | `1` | `--shots` 截图模式需要 |
 
 ---
 
@@ -89,7 +99,8 @@ CMake include 优先级：`mock/` > `cyber_cat/src/` > `lvgl/`，确保 mock 头
 brew install sdl2 cmake ninja
 ```
 
-- **LVGL 版本**：`../lvgl` master（v9.5+）；固件用 9.3，API 兼容
+- **LVGL 版本**：`../lvgl` 子模块锁定 v9.3.0，与固件 `lvgl/lvgl@~9.3.0` 一致
+- **CMake**：LVGL 9.3 的 CMake 不会给 lvgl 目标加 SDL 头文件路径，`CMakeLists.txt` 中手动补了 `target_include_directories(lvgl PUBLIC ${SDL2_INCLUDE_DIRS})`
 - **macOS**：Apple Silicon，Homebrew SDL2 路径 `/opt/homebrew`
 
 ---
@@ -110,4 +121,4 @@ brew install sdl2 cmake ninja
 | `SDL.h not found` | `LV_SDL_INCLUDE_PATH` 仍为 `<SDL2/SDL.h>` | 改为 `<SDL.h>`（见上表） |
 | `lv_conf.h not found` | cmake 未指定 `-DLV_BUILD_CONF_PATH` | 加参数重新 `cmake -B build` |
 | 窗口弹出但立刻退出 | SDL2 事件循环问题 | 检查 `handleEvents()` 返回值 |
-| 表情切换无反应 | `touch_data.gesture` 只保持一帧 | 正常：每帧清零，符合 `_prevGesture` 去重逻辑 |
+| 截图模式卡住 / 崩溃 | 截图耗时让帧间 dt 变大 | `Spring::step` 已用隐式积分 + 子步，若改回显式积分会复现 |

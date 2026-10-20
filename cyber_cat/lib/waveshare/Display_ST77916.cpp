@@ -325,10 +325,7 @@ void LCD_Init() {
 
 void LCD_addWindow(uint16_t Xstart, uint16_t Ystart, uint16_t Xend, uint16_t Yend, uint16_t *color)
 {
-  uint32_t size = (Xend - Xstart + 1) * (Yend - Ystart + 1);
-  for (size_t i = 0; i < size; i++) {
-    color[i] = (((color[i] >> 8) & 0xFF) | ((color[i] << 8) & 0xFF00));
-  }
+  // color must already be big-endian RGB565 (byte-swapped by the caller).
   Xend = Xend + 1;
   Yend = Yend + 1;
   if (Xend > EXAMPLE_LCD_WIDTH)

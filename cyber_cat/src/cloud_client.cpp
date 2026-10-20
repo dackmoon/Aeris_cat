@@ -89,7 +89,7 @@ void CloudClient::begin(const char *apiKey,    const char *apiBase,    const cha
 }
 
 bool CloudClient::sendChat(const char *message) {
-    if (_state == CLOUD_BUSY) return false;
+    if (isBusy()) return false;
 
     size_t len  = strlen(message);
     _pendingMsg = (char *)ps_malloc(len + 1);
@@ -117,7 +117,7 @@ bool CloudClient::sendChat(const char *message) {
 }
 
 bool CloudClient::sendAudio(const uint8_t *pcm, size_t bytes) {
-    if (_state == CLOUD_BUSY) return false;
+    if (isBusy()) return false;
     if (!pcm || bytes == 0) {
         strlcpy(_errMsg, "sendAudio: empty buffer", ERR_BUF_SIZE);
         _state = CLOUD_ERROR;
@@ -159,6 +159,39 @@ const char *CloudClient::getTranscript() const { return _transcript ? _transcrip
 const char *CloudClient::getEmotion()    const { return _emotion; }
 
 void CloudClient::consume() { _state = CLOUD_IDLE; }
+
+void CloudClient::setSessionPrefix(const char *prefix) {
+    strlcpy(_sessionPrefix, prefix ? prefix : "", sizeof(_sessionPrefix));
+}
+
+bool CloudClient::isBusy() const {
+    CloudState s = _state;
+    return s == CLOUD_BUSY || s == CLOUD_STT_DONE;
+}
+
+void CloudClient::cancel() {
+    portENTER_CRITICAL(&_mux);
+    if (isBusy()) {
+        _cancelled = true;
+    } else {
+        _state = CLOUD_IDLE;
+    }
+    portEXIT_CRITICAL(&_mux);
+}
+
+// Final state written by a worker; a cancelled request lands in CLOUD_IDLE.
+void CloudClient::_finish(CloudState s) {
+    portENTER_CRITICAL(&_mux);
+    _state = _cancelled ? CLOUD_IDLE : s;
+    _cancelled = false;
+    portEXIT_CRITICAL(&_mux);
+}
+
+void CloudClient::_setProgress(CloudState s) {
+    portENTER_CRITICAL(&_mux);
+    if (!_cancelled) _state = s;
+    portEXIT_CRITICAL(&_mux);
+}
 
 // =============================================================
 //  Internal: LLM chat (POST /chat/completions)
@@ -395,12 +428,12 @@ void CloudClient::_chatWorkerTask(void *param) {
     Serial.println("[Cloud] Chat worker started");
 
     bool ok = self->_doChat(self->_pendingMsg);
-    self->_state = ok ? CLOUD_DONE : CLOUD_ERROR;
 
     if (self->_pendingMsg) {
         free(self->_pendingMsg);
         self->_pendingMsg = nullptr;
     }
+    self->_finish(ok ? CLOUD_DONE : CLOUD_ERROR);
     Serial.println("[Cloud] Chat worker done");
     vTaskDelete(nullptr);
 }
@@ -422,7 +455,7 @@ void CloudClient::_sttWorkerTask(void *param) {
         self->_pendingPcm   = nullptr;
         self->_pendingBytes = 0;
     }
-    self->_state = ok ? CLOUD_DONE : CLOUD_ERROR;
+    self->_finish(ok ? CLOUD_DONE : CLOUD_ERROR);
     Serial.printf("[Cloud] Backend chat %s\n", ok ? "done" : "failed");
 
 #else
@@ -436,21 +469,21 @@ void CloudClient::_sttWorkerTask(void *param) {
     }
 
     if (!sttOk) {
-        self->_state = CLOUD_ERROR;
+        self->_finish(CLOUD_ERROR);
         Serial.println("[Cloud] STT failed");
         vTaskDelete(nullptr);
         return;
     }
 
-    self->_state = CLOUD_STT_DONE;
+    self->_setProgress(CLOUD_STT_DONE);
     Serial.println("[Cloud] STT done, sending to LLM...");
     bool chatOk = self->_doChat(self->_pendingMsg);
-    self->_state = chatOk ? CLOUD_DONE : CLOUD_ERROR;
 
     if (self->_pendingMsg) {
         free(self->_pendingMsg);
         self->_pendingMsg = nullptr;
     }
+    self->_finish(chatOk ? CLOUD_DONE : CLOUD_ERROR);
     Serial.println("[Cloud] STT worker done");
 #endif
 
@@ -461,7 +494,7 @@ void CloudClient::_sttWorkerTask(void *param) {
 //  Public: sendTTS
 // =============================================================
 bool CloudClient::sendTTS(const char *text) {
-    if (_state == CLOUD_BUSY) return false;
+    if (isBusy()) return false;
     if (!text || text[0] == '\0') {
         strlcpy(_errMsg, "sendTTS: empty text", ERR_BUF_SIZE);
         _state = CLOUD_ERROR;
@@ -593,7 +626,7 @@ bool CloudClient::_doTts(const char *text) {
                 Serial.println("\nWAV_DUMP_END");
 #endif
                 es8311BoostForTTS(70);
-                ok = es8311Play(buf, totalRead);
+                ok = es8311Play(buf, totalRead, &_cancelled);
                 es8311RestoreVolume();
                 heap_caps_free(buf);
                 if (!ok) strlcpy(_errMsg, "TTS: playback failed", ERR_BUF_SIZE);
@@ -619,7 +652,7 @@ void CloudClient::_ttsWorkerTask(void *param) {
         self->_pendingMsg = nullptr;
     }
 
-    self->_state = ok ? CLOUD_TTS_DONE : CLOUD_ERROR;
+    self->_finish(ok ? CLOUD_TTS_DONE : CLOUD_ERROR);
     Serial.printf("[Cloud] TTS worker done (%s)\n", ok ? "OK" : "FAIL");
     vTaskDelete(nullptr);
 }
@@ -655,7 +688,9 @@ bool CloudClient::_doBackendChat() {
     }
 
     http.addHeader("Content-Type", "audio/wav");
-    http.addHeader("X-Session-ID", WiFi.macAddress());
+    String session = WiFi.macAddress();
+    if (_sessionPrefix[0]) session = String(_sessionPrefix) + "-" + session;
+    http.addHeader("X-Session-ID", session);
 
     int code = http.POST(wav, wavSize);
     heap_caps_free(wav);
@@ -750,7 +785,7 @@ bool CloudClient::_downloadAndPlayWav(const char *url) {
 
             if (totalRead >= 44) {
                 es8311BoostForTTS(70);
-                ok = es8311Play(buf, totalRead);
+                ok = es8311Play(buf, totalRead, &_cancelled);
                 es8311RestoreVolume();
                 if (!ok) strlcpy(_errMsg, "TTS download: playback failed", ERR_BUF_SIZE);
             } else {

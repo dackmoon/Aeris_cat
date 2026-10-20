@@ -1,6 +1,7 @@
 #pragma once
 #include <stdint.h>
 #include <stddef.h>
+#include <atomic>
 
 // Initialize ES8311 DAC via I2C.
 // Must be called after Wire.begin() and es7210Init(), before I2S starts.
@@ -10,8 +11,20 @@ bool es8311Init(uint32_t sampleRate = 16000);
 // Play WAV data (44-byte header + 16-bit PCM, mono or stereo).
 // Blocking — runs inside a FreeRTOS task, not the main loop.
 // Enables PA (GPIO15) before playback, mutes after.
-// Returns true on success.
-bool es8311Play(const uint8_t *wavData, size_t wavBytes);
+// Returns true on success, including when stopped early via `abort`.
+// If `abort` becomes true during playback, output stops within one chunk (~32ms)
+// and es8311WasAborted() returns true until the next play.
+bool es8311Play(const uint8_t *wavData, size_t wavBytes,
+                const std::atomic<bool> *abort = nullptr);
+bool es8311WasAborted();
+
+// RMS of the samples currently leaving the speaker (DMA latency compensated);
+// 0 when idle. Safe to read from any core.
+uint16_t es8311GetPlayLevel();
+
+// Keep the power amplifier off during playback (timing and level still behave
+// as normal). Used for silent on-device testing.
+void es8311SetSilent(bool silent);
 
 // Set DAC output volume. vol_pct: 0 (mute) – 100 (max).
 // Persists as the user base volume — this is the hook for voice-command volume control.

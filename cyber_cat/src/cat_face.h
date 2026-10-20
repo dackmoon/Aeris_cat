@@ -1,97 +1,137 @@
 #pragma once
 #include <lvgl.h>
+#include <stdint.h>
 
-enum CatExpression {
-    CAT_NEUTRAL = 0,
-    CAT_HAPPY,
-    CAT_LISTENING,   // recording — large asymmetric eyes, subtle pulse
-    CAT_THINKING,    // waiting for AI — narrowed tilted eyes, slow gaze
-    CAT_SLEEPY,
-    CAT_TALKING,
-    CAT_EXPR_COUNT
+// What the cat is doing — driven by the dialog state machine in main.cpp.
+enum CatActivity : uint8_t {
+    ACT_IDLE = 0,
+    ACT_LISTENING,
+    ACT_THINKING,
+    ACT_TALKING,
+    ACT_SLEEPING,
+    ACT_COUNT
 };
 
-const char *catExprName(CatExpression e);
+// How the cat feels — sets the eye shape; layered on top of any activity.
+enum CatMood : uint8_t {
+    MOOD_NEUTRAL = 0,
+    MOOD_HAPPY,
+    MOOD_CURIOUS,
+    MOOD_CONFUSED,
+    MOOD_SURPRISED,
+    MOOD_COUNT
+};
 
-typedef void (*LongPressCb)();
-typedef bool (*TapCb)();     // return true = tap consumed (skip default Happy)
+// Optional decoration layers (bit mask).
+enum : uint8_t {
+    DECOR_NONE   = 0,
+    DECOR_PUPILS = 1 << 0,
+    DECOR_BLUSH  = 1 << 1,
+    DECOR_MOUTH  = 1 << 2,
+    DECOR_ALL    = DECOR_PUPILS | DECOR_BLUSH | DECOR_MOUTH,
+};
 
+const char *catActivityName(CatActivity a);
+const char *catMoodName(CatMood m);
+
+// Procedural cat face. Every eye parameter follows its target through a damped
+// spring, so any change of activity/mood mid-animation stays continuous.
+// All methods must be called with the LVGL lock held (LVGL task / update cb).
 class CatFace {
 public:
-    // Eye geometry — also used by file-scope talk-stage table in cat_face.cpp
-    struct EyeState { int16_t cx, cy, w, h, rot; };
+    struct Spring {
+        float x = 0, v = 0, target = 0;
+        float freq = 4.0f, damp = 0.8f;
+        void step(float dt);
+        void snap(float value) { x = target = value; v = 0; }
+    };
 
-    void create(lv_obj_t *parent);
-    void setExpression(CatExpression expr);
-    CatExpression getExpression() const { return _cur; }
-    uint32_t lastInteractMs() const { return _lastTouchMs; }
-    void update();
+    enum Param : uint8_t { P_DX, P_DY, P_W, P_H, P_LID, P_TILT, P_BOT, P_COUNT };
 
-    // Drowsy transition: slowly shrinks eye height toward 20px over 3000ms.
-    // Called at the 90s idle mark; setExpression(CAT_SLEEPY) follows at 120s.
-    // No-op if already SLEEPY or in an active dialog expression.
-    void startDrowsy();
+    // Eye pose relative to the eye's home position. lid: upper-lid cover 0..1;
+    // tilt: + lowers the inner corner of the upper lid; bot: lower-lid push 0..1.
+    struct Pose { float dx, dy, w, h, lid, tilt, bot; };
 
-    void onLongPress(LongPressCb cb) { _longPressCb = cb; }
-    void onTap(TapCb cb)             { _tapCb = cb; }
+    void create(lv_obj_t *parent);   // also starts the internal 16ms tick timer
+
+    void setActivity(CatActivity a);
+    void setMood(CatMood m);
+    void pulseMood(CatMood m, uint32_t durationMs);
+    void setDrowsiness(float d);              // 0..1, only applied while idle
+    void setSpeechLevel(uint16_t rms);        // speaker output level while talking
+    void setListenLevel(uint16_t rms);        // microphone level while listening
+    void setTouch(bool pressed, int16_t x, int16_t y);
+    void setDecor(uint8_t mask);
+    // Tooling (simulator snapshots): disable random blinks and glances.
+    void setAutoBehaviours(bool on) { _auto = on; }
+
+    CatActivity activity() const { return _activity; }
+    CatMood     mood() const;                 // effective mood (pulse wins)
+    uint8_t     decor() const { return _decor; }
 
 private:
-    lv_obj_t *_scr  = nullptr;
-    lv_obj_t *_eyeL = nullptr;
-    lv_obj_t *_eyeR = nullptr;
+    struct EyeGeom {
+        int16_t x1, y1, x2, y2;     // eye white bounds
+        int16_t lidOuter, lidInner; // upper-lid edge y at outer / inner side
+        int16_t botCy, botR;        // lower-lid circle (botR = 0: none)
+        int16_t px, py, pr;         // pupil (pr = 0: none)
+        bool operator!=(const EyeGeom &o) const;
+    };
+    struct DecorGeom {
+        int16_t blushDx, blushDy;
+        uint8_t blushOpa;
+        int16_t mouthX, mouthY, mouthR, mouthOpen;
+        bool operator!=(const DecorGeom &o) const;
+    };
 
-    EyeState _stL{}, _stR{};           // Target expression eye state
-    EyeState _fromL{}, _fromR{};       // Expression anim start state
-    EyeState _baseL{}, _baseR{};       // Current interpolated base (before blink/look)
+    lv_obj_t   *_obj = nullptr;
+    lv_timer_t *_timer = nullptr;
+    uint32_t    _lastTickMs = 0;
 
-    int32_t _exprProgress = 1000;      // 0 = from, 1000 = target
+    CatActivity _activity = ACT_IDLE;
+    uint32_t    _activitySinceMs = 0;
+    CatMood     _mood = MOOD_NEUTRAL;
+    CatMood     _pulseMood = MOOD_NEUTRAL;
+    uint32_t    _pulseUntilMs = 0;
+    uint32_t    _wakeMs = 0;
+    float       _drowsy = 0;
+    uint16_t    _speechRms = 0, _listenRms = 0;
+    float       _speechEnv = 0, _listenEnv = 0;
+    bool        _touch = false;
+    int16_t     _touchX = 0, _touchY = 0;
+    uint8_t     _decor = DECOR_NONE;
+    bool        _auto = true;
 
-    CatExpression _cur      = CAT_NEUTRAL;
-    CatExpression _baseExpr = CAT_NEUTRAL;
+    Spring _eye[2][P_COUNT];
+    Spring _gazeX, _gazeY;
+    Spring _blushOpa, _mouthOpen;
 
-    uint8_t  _animEpoch   = 0;         // incremented on each _apply(); guards stale done-callbacks
-    int32_t  _blinkFactor  = 0;        // 0 = open, 1000 = closed
-    int32_t  _breathFactor = 0;        // 0 = -2px, 1000 = +2px (Neutral breathing rhythm)
-    int32_t  _drowsyH      = -1;       // current eye h override during drowsy transition (-1 = inactive)
+    float    _gazeTgtX = 0, _gazeTgtY = 0;
+    uint32_t _nextGazeMs = 0;
+    bool     _thinkLeft = false;
 
-    int16_t  _lookDX = 0, _lookDY = 0;
-    int16_t  _lookTgtDX = 0, _lookTgtDY = 0;
+    uint32_t _blinkStartMs = 0;
+    uint16_t _blinkCloseMs = 0, _blinkOpenMs = 0;
+    uint8_t  _blinkOffsetMs = 0;
+    bool     _blinkTwice = false;
+    uint32_t _nextBlinkMs = 0;
 
-    // Talking: two reusable staging buffers (LVGL copies them on lv_anim_start)
-    lv_anim_t _talkAnimL{};
-    lv_anim_t _talkAnimR{};
-    int8_t    _talkStage = -1;         // -1 = idle, 0-3 = current loop stage
+    EyeGeom   _geom[2]{};
+    DecorGeom _decorGeom{};
 
-    uint32_t _lastTouchMs   = 0;      // millis() of last processed gesture
-    uint8_t  _prevGesture   = 0;      // GESTURE enum value (0 = NONE)
-    uint32_t _touchHappyEnd = 0;
-    LongPressCb _longPressCb = nullptr;
-    TapCb       _tapCb       = nullptr;
+    static void _timerCb(lv_timer_t *t);
+    static void _drawCb(lv_event_t *e);
+    static void _drawEye(lv_layer_t *layer, int eye, const EyeGeom &g);
 
-    void _placeEye(lv_obj_t *eye, const EyeState &st,
-                   int16_t dx = 0, int16_t dy = 0);
-    void _apply(CatExpression e);
-    void _render();
-    void _scheduleBlink();
-    void _scheduleLook();
-    void _scheduleBreath();
-
-    void _startTalking(uint32_t initialDelay = 0);
-    void _stopTalking();
-    void _startTalkStage(int stage, uint32_t delay = 0);
-
-    static EyeState _lerpState(const EyeState &a, const EyeState &b, int32_t t);
-
-    static void _exprAnimCb(void *var, int32_t v);
-    static void _blinkAnimCb(void *var, int32_t v);
-    static void _blinkDoneCb(lv_anim_t *a);
-    static void _lookAnimCb(void *var, int32_t v);
-    static void _lookDoneCb(lv_anim_t *a);
-    static void _breathAnimCb(void *var, int32_t v);
-    static void _drowsyAnimCb(void *var, int32_t v);
-    static void _talkExecCbL(void *var, int32_t t);
-    static void _talkExecCbR(void *var, int32_t t);
-    static void _talkDoneCb(lv_anim_t *a);
+    void _tick();
+    void _targets(uint32_t now, Pose out[2]) const;
+    void _scheduleGaze(uint32_t now);
+    void _scheduleBlink(uint32_t now, bool soon);
+    float _blinkAmount(uint32_t now, int eye) const;
+    void _computeGeom(uint32_t now, EyeGeom out[2], DecorGeom &decor);
+    void _invalidate(const EyeGeom &g);
+    void _invalidateDecor(const DecorGeom &d);
+    void _draw(lv_layer_t *layer) const;
 };
 
 extern CatFace catFace;

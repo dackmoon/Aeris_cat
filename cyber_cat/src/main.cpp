@@ -1,5 +1,7 @@
 #include <Arduino.h>
+#include <atomic>
 #include <esp_task_wdt.h>
+#include <esp_heap_caps.h>
 
 #include "I2C_Driver.h"
 #include "TCA9554PWR.h"
@@ -11,53 +13,86 @@
 #include "audio_input.h"
 #include "es8311_spk.h"
 #include "chat_ticker.h"
+#include "speech_sample.h"
 #include "secrets.h"
 
 // ============================================================
 //  Constants
 // ============================================================
-#define IDLE_TIMEOUT_MS      120000UL   // full SLEEPY at 120s
-#define IDLE_DROWSY_MS        90000UL   // startDrowsy() at 90s
+#define DROWSY_START_MS       75000UL   // eyelids start drooping
+#define SLEEP_AFTER_MS       120000UL   // fall asleep
 #define THINKING_TIMEOUT_MS   20000UL
+#define LONG_PRESS_MS           600UL
+#define STRESS_GAP_MS          1500UL
 
 // ============================================================
-//  Dialog state machine
+//  Dialog state machine (Core 1)
 // ============================================================
 enum DialogState {
     DIALOG_IDLE,
     DIALOG_LISTENING,
     DIALOG_THINKING,
-    DIALOG_TALKING,   // TTS playing (or timer placeholder until TTS implemented)
+    DIALOG_TALKING,
+    DIALOG_SLEEPING,
 };
 
-static volatile DialogState dialogState = DIALOG_IDLE;
-static uint32_t _thinkingStartMs = 0;
+static const char *dialogName(DialogState s) {
+    static const char *N[] = {"Idle", "Listening", "Thinking", "Talking", "Sleeping"};
+    return N[s];
+}
+
+static DialogState dialogState = DIALOG_IDLE;
+static uint32_t _stateSinceMs    = 0;
+static uint32_t _lastInteractMs  = 0;
 static bool     _sttShown        = false;
-static uint32_t _touchReEnableMs = 0;
-static uint32_t _talkingStartMs  = 0;
 static uint32_t _talkingDurMs    = 0;
-static uint32_t _tickerClearMs        = 0;     // when to hide the chat ticker (0 = no pending clear)
-static volatile bool _tickerClearNow  = false; // immediate clear request from Core 1
+static CatMood  _replyMood       = MOOD_NEUTRAL;
+
+// Recorded audio waiting for the cloud worker to become free (e.g. a cancelled
+// request still unwinding). Sent from loop() as soon as the worker is idle.
+static const uint8_t *_sendPcm   = nullptr;
+static size_t         _sendBytes = 0;
+
+// Silent stress test ("stress <n>"): fake dialogs with the embedded sample.
+static bool     _stressActive = false;
+static int      _stressLeft = 0;
+static int      _stressOk   = 0;
+static int      _stressFail = 0;
+static bool     _silent     = false;
 
 // ============================================================
-//  Cross-core communication: visual updates
-//  Written by main loop (Core 1), read by LVGL callback (Core 0)
+//  Cross-core: face requests (Core 1 → Core 0)
+//  CatFace is only touched inside lvglUpdateCb (LVGL task).
 // ============================================================
-static volatile bool         _exprDirty   = false;
-static volatile CatExpression _exprPending = CAT_NEUTRAL;
+static std::atomic<int>      _reqActivity{ACT_IDLE};
+static std::atomic<int>      _reqMood{MOOD_NEUTRAL};
+static std::atomic<int>      _reqDrowsy{0};          // 0..1000
+static std::atomic<int>      _reqDecor{DECOR_NONE};
+static std::atomic<int>      _reqPulseMood{MOOD_NEUTRAL};
+static std::atomic<uint32_t> _reqPulseMs{0};
+static std::atomic<bool>     _reqPulse{false};
 
-static char          _tickerUserBuf[256];
-static volatile bool _tickerUserReady = false;
-static char          _tickerAIBuf[1024];
-static volatile bool _tickerAIReady   = false;
+static void faceActivity(CatActivity a) { _reqActivity = a; }
+static void faceMood(CatMood m)         { _reqMood = m; }
+static void faceDrowsy(float d)         { _reqDrowsy = (int)(d * 1000); }
+static void facePulse(CatMood m, uint32_t ms) {
+    _reqPulseMood = m;
+    _reqPulseMs   = ms;
+    _reqPulse     = true;
+}
 
-// ============================================================
-//  Cross-core communication: gesture commands
-//  Written by LVGL callbacks (Core 0), read by main loop (Core 1)
-// ============================================================
-static volatile bool _cmdRecord = false;
-static volatile bool _cmdCancel = false;
-static volatile bool _cmdThink  = false;
+// Chat ticker (Core 1 → Core 0)
+static char               _tickerUserBuf[256];
+static std::atomic<bool>  _tickerUserReady{false};
+static char               _tickerAIBuf[1024];
+static std::atomic<bool>  _tickerAIReady{false};
+static std::atomic<bool>  _tickerClearNow{false};
+static uint32_t           _tickerClearMs = 0;
+
+// Gestures (Core 0 → Core 1)
+static std::atomic<bool>     _gTap{false};
+static std::atomic<bool>     _gLong{false};
+static std::atomic<uint32_t> _gTouchMs{0};
 
 // ============================================================
 //  Globals
@@ -66,153 +101,204 @@ static lv_obj_t    *wifi_dot = nullptr;
 static CloudClient  cloud;
 
 // ============================================================
-//  State helpers — called from main loop (Core 1) only
+//  State helpers — Core 1 only
 // ============================================================
-static void requestExpr(CatExpression e) {
-    _exprPending = e;
-    _exprDirty   = true;
+static void setState(DialogState s) {
+    if (s != dialogState) Serial.printf("[Main] %u %s -> %s\n", (unsigned)millis(), dialogName(dialogState), dialogName(s));
+    dialogState   = s;
+    _stateSinceMs = millis();
+}
+
+// Stops whatever the cloud worker is doing. A running worker finishes in the
+// background and lands on CLOUD_IDLE; a finished result is simply dropped.
+static void cloudReset() {
+    if (cloud.isBusy()) cloud.cancel();
+    else                cloud.consume();
+}
+
+static void stressResult(bool ok) {
+    if (!_stressActive) return;
+    if (ok) _stressOk++; else _stressFail++;
+    Serial.printf("[Stress] %s  ok=%d fail=%d left=%d\n", ok ? "PASS" : "FAIL",
+                  _stressOk, _stressFail, _stressLeft);
+    if (_stressLeft == 0) {
+        Serial.printf("[Stress] done: ok=%d fail=%d\n", _stressOk, _stressFail);
+        _stressActive = false;
+        es8311SetSilent(_silent);
+    }
 }
 
 static void enterIdle() {
-    dialogState = DIALOG_IDLE;
+    setState(DIALOG_IDLE);
     audioInputClear();
-    lvgl_set_flush_skip(false);
-    _touchReEnableMs = millis() + 2000;
-    _tickerClearMs   = millis() + 8000;  // hide chat ticker 8s after returning to idle
-    requestExpr(CAT_NEUTRAL);
-    Serial.println("[Main] -> IDLE");
+    _sendPcm = nullptr;
+    _lastInteractMs = millis();
+    _tickerClearMs  = millis() + 8000;
+    faceActivity(ACT_IDLE);
+    faceDrowsy(0);
+}
+
+static void failToIdle(const char *why) {
+    Serial.printf("[Main] %s -> IDLE (confused)\n", why);
+    cloudReset();
+    enterIdle();
+    faceMood(MOOD_NEUTRAL);
+    facePulse(MOOD_CONFUSED, 1500);
+    stressResult(false);
 }
 
 static void enterListening() {
-    dialogState = DIALOG_LISTENING;
-    _tickerClearMs  = 0;            // cancel pending timed clear
-    _tickerClearNow = true;         // immediately clear ticker on Core 0
-    audioInputStart();
-    requestExpr(CAT_LISTENING);
-    Serial.println("[Main] -> LISTENING");
-}
-
-static CatExpression emotionToExpr(const char *emotion) {
-    if (emotion) {
-        if (strcmp(emotion, "happy")    == 0) return CAT_HAPPY;
-        if (strcmp(emotion, "neutral")  == 0) return CAT_NEUTRAL;
-        if (strcmp(emotion, "thinking") == 0) return CAT_THINKING;
+    if (!wifiConnected()) {
+        Serial.println("[Main] No WiFi — can't listen");
+        facePulse(MOOD_CONFUSED, 1500);
+        return;
     }
-    return CAT_TALKING;  // default: "talking" or unknown
+    setState(DIALOG_LISTENING);
+    _sendPcm        = nullptr;
+    _tickerClearMs  = 0;
+    _tickerClearNow = true;
+    audioInputStart();
+    faceMood(MOOD_NEUTRAL);
+    faceActivity(ACT_LISTENING);
 }
 
-static void enterTalking(const char *aiText, CatExpression expr = CAT_TALKING) {
-    dialogState = DIALOG_TALKING;
-    _talkingStartMs = millis();
-    _talkingDurMs   = 30000;  // hard watchdog — TTS should finish well before this
+static void enterThinking(const uint8_t *pcm, size_t bytes) {
+    setState(DIALOG_THINKING);
+    _sttShown  = false;
+    _sendPcm   = pcm;
+    _sendBytes = bytes;
+    faceActivity(ACT_THINKING);
+    Serial.printf("[Main] %u bytes of audio queued\n", (unsigned)bytes);
+}
 
-    // Re-enable flush so TALKING animation plays on screen
-    lvgl_port_lock(0);
-    lvgl_set_flush_skip(false);
-    lvgl_port_unlock();
+static CatMood emotionToMood(const char *emotion) {
+    if (emotion) {
+        if (strcmp(emotion, "happy")    == 0) return MOOD_HAPPY;
+        if (strcmp(emotion, "thinking") == 0) return MOOD_CURIOUS;
+    }
+    return MOOD_NEUTRAL;   // "neutral", "talking" or unknown
+}
 
-    requestExpr(expr);
+static void enterTalking(const char *aiText, CatMood mood) {
+    setState(DIALOG_TALKING);
+    _replyMood    = mood;
+    _talkingDurMs = 30000;   // hard watchdog — TTS should finish well before this
+    faceMood(mood);
+    faceActivity(ACT_TALKING);
 
-    // Launch TTS: download WAV from SiliconFlow and play via ES8311 (Core 1 worker)
     if (!cloud.sendTTS(aiText)) {
         Serial.printf("[Main] sendTTS failed: %s — timer fallback\n", cloud.getError());
         cloud.consume();
-        // Fallback: estimate from UTF-8 byte length (Chinese ≈ 3 bytes/char × 100ms/char)
+        // Chinese ≈ 3 bytes/char × 100ms/char
         size_t len = aiText ? strlen(aiText) : 0;
         _talkingDurMs = (uint32_t)(len / 3) * 100;
         if (_talkingDurMs < 2000)  _talkingDurMs = 2000;
         if (_talkingDurMs > 10000) _talkingDurMs = 10000;
-        Serial.printf("[Main] -> TALKING (timer fallback %ums)\n", (unsigned)_talkingDurMs);
-    } else {
-        Serial.println("[Main] -> TALKING (TTS started)");
     }
 }
 
-static void enterThinking() {
-    audioInputStop();
-    dialogState = DIALOG_THINKING;
-    _thinkingStartMs = millis();
-    _sttShown = false;
-    requestExpr(CAT_THINKING);
-    Serial.printf("[Main] -> THINKING (%u bytes recorded)\n",
-                  (unsigned)audioInputGetBytes());
+static void finishTalking() {
+    cloud.consume();
+    enterIdle();
+    faceMood(MOOD_NEUTRAL);
+    if (_replyMood != MOOD_NEUTRAL) facePulse(_replyMood, 3000);   // linger a moment
+    stressResult(true);
+}
 
-    // Synchronize: wait for any in-flight lv_timer_handler() to finish,
-    // THEN set skip flags inside the lock so the next LVGL iteration
-    // skips the renderer entirely. This prevents a race where
-    // _flush_skip changes mid-render causing an infinite redraw loop.
-    lvgl_port_lock(0);
-    lvgl_set_flush_skip(true);
-    lvgl_set_touch_skip(true);
-    lvgl_port_unlock();
+static void wake() {
+    Serial.println("[Main] Wake up");
+    enterIdle();
+}
 
-    if (!cloud.sendAudio(audioInputGetBuffer(), audioInputGetBytes())) {
-        Serial.printf("[Main] sendAudio failed: %s\n", cloud.getError());
-        cloud.consume();
+// ============================================================
+//  Gestures — Core 1, dispatched by dialog state
+// ============================================================
+static void onTap() {
+    switch (dialogState) {
+    case DIALOG_IDLE:      facePulse(MOOD_HAPPY, 2000); break;
+    case DIALOG_SLEEPING:  wake(); break;
+    case DIALOG_LISTENING:
+        audioInputStop();
+        enterThinking(audioInputGetBuffer(), audioInputGetBytes());
+        break;
+    case DIALOG_TALKING:
+        Serial.println("[Main] Tap while talking -> interrupt");
+        cloudReset();
         enterIdle();
+        faceMood(MOOD_NEUTRAL);
+        facePulse(MOOD_SURPRISED, 400);
+        break;
+    case DIALOG_THINKING:  break;
     }
 }
 
-// ============================================================
-//  CatFace gesture callbacks — run on Core 0 inside LVGL task.
-//  MUST NOT call audio/cloud APIs. Only set command flags.
-// ============================================================
 static void onLongPress() {
-    DialogState ds = dialogState;
-    if (ds == DIALOG_LISTENING) {
-        _cmdCancel = true;
-    } else if (ds == DIALOG_THINKING || ds == DIALOG_TALKING) {
-        Serial.println("[UI] Busy, ignoring long press");
-    } else {
-        _cmdRecord = true;
+    switch (dialogState) {
+    case DIALOG_IDLE:      enterListening(); break;
+    case DIALOG_SLEEPING:  wake(); enterListening(); break;
+    case DIALOG_LISTENING:
+        Serial.println("[Main] Long press -> cancel recording");
+        audioInputStop();
+        enterIdle();
+        break;
+    case DIALOG_THINKING:
+        Serial.println("[Main] Long press -> cancel request");
+        cloudReset();
+        enterIdle();
+        break;
+    case DIALOG_TALKING:
+        Serial.println("[Main] Long press while talking -> interrupt and listen");
+        cloudReset();
+        enterListening();
+        break;
     }
 }
 
-static bool onTap() {
-    if (dialogState == DIALOG_LISTENING) {
-        _cmdThink = true;
-        return true;
+// ============================================================
+//  LVGL update callback — Core 0, inside the LVGL lock, before
+//  lv_timer_handler(). The only place CatFace / LVGL is touched.
+// ============================================================
+static void detectGestures(bool pressed) {
+    static bool     down = false, longFired = false;
+    static uint32_t downMs = 0;
+    uint32_t now = millis();
+    if (pressed) {
+        _gTouchMs = now;
+        if (!down) { down = true; longFired = false; downMs = now; }
+        else if (!longFired && now - downMs >= LONG_PRESS_MS) { longFired = true; _gLong = true; }
+    } else if (down) {
+        down = false;
+        if (!longFired) _gTap = true;
     }
-    return false;
 }
 
-// ============================================================
-//  LVGL update callback — runs on Core 0 every ~16ms,
-//  INSIDE the LVGL lock, BEFORE lv_timer_handler().
-//  Safe to call any LVGL / CatFace API here.
-// ============================================================
 static void lvglUpdateCb() {
-    if (_exprDirty) {
-        catFace.setExpression(_exprPending);
-        _exprDirty = false;
-    }
+    catFace.setActivity((CatActivity)_reqActivity.load());
+    catFace.setMood((CatMood)_reqMood.load());
+    catFace.setDrowsiness(_reqDrowsy.load() / 1000.0f);
+    catFace.setDecor((uint8_t)_reqDecor.load());
+    if (_reqPulse.exchange(false)) catFace.pulseMood((CatMood)_reqPulseMood.load(), _reqPulseMs.load());
 
-    // Clear chat ticker — immediate request from Core 1 or timed auto-clear
-    if (_tickerClearNow || (_tickerClearMs != 0 && millis() >= _tickerClearMs)) {
-        _tickerClearNow = false;
-        _tickerClearMs  = 0;
+    catFace.setSpeechLevel(es8311GetPlayLevel());
+    catFace.setListenLevel(audioInputGetLevel());
+
+    int16_t tx = 0, ty = 0;
+    bool pressed = lvgl_touch_pressed(&tx, &ty);
+    catFace.setTouch(pressed, tx, ty);
+    detectGestures(pressed);
+
+    if (_tickerClearNow.exchange(false) || (_tickerClearMs != 0 && millis() >= _tickerClearMs)) {
+        _tickerClearMs = 0;
         chatTickerClear();
     }
-
-    if (_tickerUserReady) {
+    if (_tickerUserReady.load()) {
         chatTickerAddUser(_tickerUserBuf);
         _tickerUserReady = false;
     }
-    if (_tickerAIReady) {
+    if (_tickerAIReady.load()) {
         chatTickerAddAI(_tickerAIBuf);
         _tickerAIReady = false;
     }
-
-    // Force a full redraw whenever we return to IDLE from any active state,
-    // so all pending visual changes (expression + subtitles) hit the LCD.
-    static DialogState _prevDs = DIALOG_IDLE;
-    DialogState ds = dialogState;
-    if (_prevDs != DIALOG_IDLE && ds == DIALOG_IDLE) {
-        lv_obj_invalidate(lv_screen_active());
-    }
-    _prevDs = ds;
-
-    catFace.update();
 
     static bool lastWifi = false;
     bool connected = wifiConnected();
@@ -221,17 +307,6 @@ static void lvglUpdateCb() {
             wifi_dot,
             connected ? lv_color_hex(0x16c79a) : lv_color_hex(0xe94560), 0);
         lastWifi = connected;
-    }
-
-    if (dialogState == DIALOG_IDLE &&
-        catFace.getExpression() != CAT_SLEEPY) {
-        uint32_t idleMs = millis() - catFace.lastInteractMs();
-        if (idleMs >= IDLE_TIMEOUT_MS) {
-            Serial.println("[UI] Idle timeout -> Sleepy");
-            catFace.setExpression(CAT_SLEEPY);
-        } else if (idleMs >= IDLE_DROWSY_MS) {
-            catFace.startDrowsy();
-        }
     }
 }
 
@@ -253,7 +328,7 @@ void setup() {
     }
 
     Serial.println("====================================");
-    Serial.println("  Cyber Cat - Phase 4 Voice Input");
+    Serial.println("  Cyber Cat");
     Serial.println("====================================");
 
     Serial.println("[1/6] I2C & TCA9554PWR...");
@@ -270,8 +345,6 @@ void setup() {
     Serial.println("[4/6] Cat Face...");
     lvgl_port_lock(0);
     catFace.create(lv_screen_active());
-    catFace.onLongPress(onLongPress);
-    catFace.onTap(onTap);
 
     wifi_dot = lv_obj_create(lv_screen_active());
     lv_obj_remove_style_all(wifi_dot);
@@ -301,16 +374,81 @@ void setup() {
 
     _tickerUserBuf[0] = '\0';
     _tickerAIBuf[0]   = '\0';
+    _lastInteractMs   = millis();
 
     lvgl_set_update_cb(lvglUpdateCb);
 
     Serial.println("====================================");
     Serial.println("  Cat ready!  (UI on Core 0, logic on Core 1)");
-    Serial.println("  Long press  -> Start recording");
-    Serial.println("  Tap         -> Stop recording / Happy");
-    Serial.println("  Long press  -> Cancel (while recording)");
-    Serial.println("  Idle 120s   -> Sleepy");
+    Serial.println("  Long press  -> Listen / cancel / interrupt");
+    Serial.println("  Tap         -> Send recording / interrupt / pet");
+    Serial.println("  Idle 75s    -> Drowsy, 120s -> Sleep");
     Serial.println("====================================");
+}
+
+// ============================================================
+//  Serial debug commands (one per line):
+//    act <n>     force face activity (0 Idle .. 4 Sleeping), until next state change
+//    mood <n>    set face mood (0 Neutral .. 4 Surprised)
+//    pulse <n>   flash a mood for 1.5s
+//    decor <m>   decoration mask: 1 pupils | 2 blush | 4 mouth (0 = off)
+//    silent <b>  1 = keep the speaker amp off
+//    tap / hold  simulate a tap / long press
+//    chat        fake dialog with the embedded speech sample ("test-" session)
+//    stress <n>  n silent fake dialogs back to back, with interrupts mixed in
+// ============================================================
+static void pollSerialCommands() {
+    static char line[32];
+    static size_t len = 0;
+    while (Serial.available()) {
+        char c = (char)Serial.read();
+        if (c != '\n' && c != '\r') {
+            if (len < sizeof(line) - 1) line[len++] = c;
+            continue;
+        }
+        if (len == 0) continue;
+        line[len] = '\0';
+        len = 0;
+
+        int n;
+        bool idle = dialogState == DIALOG_IDLE || dialogState == DIALOG_SLEEPING;
+        if (sscanf(line, "act %d", &n) == 1 && n >= 0 && n < ACT_COUNT) {
+            faceActivity((CatActivity)n);
+            Serial.printf("[Cmd] act -> %s\n", catActivityName((CatActivity)n));
+        } else if (sscanf(line, "mood %d", &n) == 1 && n >= 0 && n < MOOD_COUNT) {
+            faceMood((CatMood)n);
+            Serial.printf("[Cmd] mood -> %s\n", catMoodName((CatMood)n));
+        } else if (sscanf(line, "pulse %d", &n) == 1 && n >= 0 && n < MOOD_COUNT) {
+            facePulse((CatMood)n, 1500);
+            Serial.printf("[Cmd] pulse -> %s\n", catMoodName((CatMood)n));
+        } else if (sscanf(line, "decor %d", &n) == 1 && n >= 0 && n <= DECOR_ALL) {
+            _reqDecor = n;
+            Serial.printf("[Cmd] decor -> %d\n", n);
+        } else if (sscanf(line, "silent %d", &n) == 1) {
+            _silent = n != 0;
+            es8311SetSilent(_silent);
+            Serial.printf("[Cmd] silent -> %d\n", (int)_silent);
+        } else if (strcmp(line, "chat") == 0) {
+            if (idle) {
+                if (dialogState == DIALOG_SLEEPING) wake();
+                enterThinking(SPEECH_PCM, SPEECH_PCM_LEN);
+            } else {
+                Serial.println("[Cmd] busy, chat ignored");
+            }
+        } else if (strcmp(line, "tap") == 0) {
+            _gTap = true;
+        } else if (strcmp(line, "hold") == 0) {
+            _gLong = true;
+        } else if (sscanf(line, "stress %d", &n) == 1 && n > 0) {
+            _stressActive = true;
+            _stressLeft = n;
+            _stressOk = _stressFail = 0;
+            es8311SetSilent(true);
+            Serial.printf("[Cmd] stress x%d (silent)\n", n);
+        } else {
+            Serial.printf("[Cmd] unknown: %s\n", line);
+        }
+    }
 }
 
 // ============================================================
@@ -318,101 +456,131 @@ void setup() {
 // ============================================================
 void loop() {
     wifiLoop();
+    pollSerialCommands();
 
-    // ---- Process gesture commands from Core 0 ----
-    if (_cmdRecord) {
-        _cmdRecord = false;
-        if (!wifiConnected()) {
-            Serial.println("[Main] No WiFi — recording anyway (will fail at upload)");
-        }
-        enterListening();
+    // ---- Gestures from Core 0 ----
+    uint32_t touchMs = _gTouchMs.load();
+    if (touchMs && (int32_t)(touchMs - _lastInteractMs) > 0) {
+        _lastInteractMs = touchMs;
+        if (dialogState == DIALOG_IDLE) faceDrowsy(0);
     }
-    if (_cmdCancel) {
-        _cmdCancel = false;
-        Serial.println("[Main] Long press cancel -> IDLE");
-        audioInputStop();
-        dialogState = DIALOG_IDLE;
-        audioInputClear();
-        requestExpr(CAT_NEUTRAL);
-        Serial.println("[Main] -> IDLE");
-    }
-    if (_cmdThink) {
-        _cmdThink = false;
-        Serial.println("[Main] Tap stop recording");
-        enterThinking();
-    }
+    if (_gLong.exchange(false)) onLongPress();
+    if (_gTap.exchange(false))  onTap();
 
-    // ---- Delayed touch re-enable ----
-    if (_touchReEnableMs != 0 && millis() >= _touchReEnableMs) {
-        _touchReEnableMs = 0;
-        lvgl_set_touch_skip(false);
-    }
-
-    // ---- Audio VAD processing ----
-    if (dialogState == DIALOG_LISTENING) {
-        bool vadStop = audioInputProcess();
-        if (vadStop) {
-            enterThinking();
+    // ---- Idle: drowsiness → sleep ----
+    if (dialogState == DIALOG_IDLE) {
+        uint32_t idleMs = millis() - _lastInteractMs;
+        if (idleMs >= SLEEP_AFTER_MS) {
+            setState(DIALOG_SLEEPING);
+            faceActivity(ACT_SLEEPING);
+        } else if (idleMs >= DROWSY_START_MS) {
+            faceDrowsy((float)(idleMs - DROWSY_START_MS) / (SLEEP_AFTER_MS - DROWSY_START_MS));
         }
     }
 
-    // ---- Cloud poll ----
+    // ---- Stress test driver ----
+    // Every 4th dialog is cut short while talking (tap), the next one is
+    // cancelled while thinking (long press); the rest run to completion.
+    static int _stressIdx = 0;
+    if (_stressLeft > 0 && dialogState == DIALOG_IDLE && millis() - _stateSinceMs >= STRESS_GAP_MS) {
+        _stressLeft--;
+        _stressIdx++;
+        enterThinking(SPEECH_PCM, SPEECH_PCM_LEN);
+    }
+    if (_stressActive) {
+        uint32_t inState = millis() - _stateSinceMs;
+        if (_stressIdx % 4 == 2 && dialogState == DIALOG_TALKING && inState >= 800) {
+            Serial.println("[Stress] inject tap (interrupt talking)");
+            onTap();
+            stressResult(true);
+        } else if (_stressIdx % 4 == 3 && dialogState == DIALOG_THINKING && inState >= 1500) {
+            Serial.println("[Stress] inject long press (cancel thinking)");
+            onLongPress();
+            stressResult(true);
+        }
+    }
+
+    // ---- Recording: VAD auto-stop ----
+    if (dialogState == DIALOG_LISTENING && audioInputProcess()) {
+        enterThinking(audioInputGetBuffer(), audioInputGetBytes());
+    }
+
+    // ---- Thinking: send queued audio, then poll ----
     if (dialogState == DIALOG_THINKING) {
-        CloudState cs = cloud.poll();
-        if (cs == CLOUD_STT_DONE && !_sttShown) {
-            _sttShown = true;
-            const char *transcript = cloud.getTranscript();
-            if (transcript && transcript[0] != '\0') {
-                Serial.printf("[Main] STT: %s\n", transcript);
-                strlcpy(_tickerUserBuf, transcript, sizeof(_tickerUserBuf));
-                _tickerUserReady = true;
+        if (_sendPcm) {
+            if (!cloud.isBusy()) {
+                cloud.consume();
+                cloud.setSessionPrefix(_sendPcm == SPEECH_PCM ? "test" : nullptr);
+                bool ok = cloud.sendAudio(_sendPcm, _sendBytes);
+                _sendPcm = nullptr;
+                audioInputClear();
+                if (!ok) {
+                    char why[96];
+                    snprintf(why, sizeof(why), "sendAudio failed: %s", cloud.getError());
+                    failToIdle(why);
+                }
             }
-        } else if (cs == CLOUD_DONE) {
-            const char *reply   = cloud.getResponse();
-            CatExpression expr  = emotionToExpr(cloud.getEmotion());
-            Serial.printf("[Main] AI: %s (emotion=%s)\n", reply, cloud.getEmotion());
-            strlcpy(_tickerAIBuf, reply, sizeof(_tickerAIBuf));
-            _tickerAIReady = true;
-            cloud.consume();
-            enterTalking(reply, expr);
-        } else if (cs == CLOUD_ERROR) {
-            Serial.printf("[Main] Cloud error: %s\n", cloud.getError());
-            cloud.consume();
-            enterIdle();
-        } else if (millis() - _thinkingStartMs >= THINKING_TIMEOUT_MS) {
-            Serial.println("[Main] THINKING timeout -> IDLE");
-            cloud.consume();
-            enterIdle();
+        } else {
+            CloudState cs = cloud.poll();
+            if (cs == CLOUD_STT_DONE && !_sttShown) {
+                _sttShown = true;
+                const char *transcript = cloud.getTranscript();
+                if (transcript && transcript[0] != '\0') {
+                    Serial.printf("[Main] STT: %s\n", transcript);
+                    strlcpy(_tickerUserBuf, transcript, sizeof(_tickerUserBuf));
+                    _tickerUserReady = true;
+                }
+            } else if (cs == CLOUD_DONE) {
+                const char *reply = cloud.getResponse();
+                CatMood mood = emotionToMood(cloud.getEmotion());
+                Serial.printf("[Main] AI: %s (emotion=%s)\n", reply, cloud.getEmotion());
+                strlcpy(_tickerAIBuf, reply, sizeof(_tickerAIBuf));
+                _tickerAIReady = true;
+                cloud.consume();
+                enterTalking(_tickerAIBuf, mood);
+            } else if (cs == CLOUD_ERROR) {
+                failToIdle(cloud.getError());
+            } else if (cs == CLOUD_IDLE) {
+                failToIdle("request dropped");
+            }
+        }
+        if (dialogState == DIALOG_THINKING && millis() - _stateSinceMs >= THINKING_TIMEOUT_MS) {
+            failToIdle("THINKING timeout");
         }
     }
 
-    // ---- TALKING: wait for TTS worker, hard timeout as fallback ----
+    // ---- Talking: wait for TTS worker, hard timeout as fallback ----
     if (dialogState == DIALOG_TALKING) {
         CloudState cs = cloud.poll();
         if (cs == CLOUD_TTS_DONE) {
-            cloud.consume();
-            enterIdle();
+            finishTalking();
         } else if (cs == CLOUD_ERROR) {
-            Serial.printf("[Main] TTS error: %s\n", cloud.getError());
-            cloud.consume();
-            enterIdle();
-        } else if (millis() - _talkingStartMs >= _talkingDurMs) {
-            Serial.println("[Main] TALKING timeout -> IDLE");
-            cloud.consume();
-            enterIdle();
+            failToIdle(cloud.getError());
+        } else if (millis() - _stateSinceMs >= _talkingDurMs) {
+            Serial.println("[Main] TALKING timeout");
+            cloudReset();
+            finishTalking();
         }
     }
 
-    // ---- Periodic health report (always on, minimal overhead) ----
+    // ---- Periodic health report ----
     static uint32_t _mainLoopCount = 0;
     _mainLoopCount++;
     static uint32_t _healthMs = 0;
-    if (millis() - _healthMs >= 10000) {
+    static uint32_t _healthFrames = 0;
+    uint32_t elapsed = millis() - _healthMs;
+    if (elapsed >= 10000) {
         _healthMs = millis();
-        Serial.printf("[Health] main=%u lvgl=%u heap=%u ds=%d wifi=%d\n",
+        uint32_t frames = lvgl_get_frame_count();
+        float fps = (frames - _healthFrames) * 1000.0f / elapsed;
+        _healthFrames = frames;
+        Serial.printf("[Health] main=%u lvgl=%u heap=%u psram=%u ds=%s wifi=%d fps=%.1f render_max=%ums face=%s/%s\n",
                       (unsigned)_mainLoopCount, (unsigned)lvgl_get_loop_count(),
                       (unsigned)esp_get_free_heap_size(),
-                      (int)dialogState, (int)wifiConnected());
+                      (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+                      dialogName(dialogState), (int)wifiConnected(),
+                      fps, (unsigned)lvgl_take_render_max_ms(),
+                      catActivityName(catFace.activity()), catMoodName(catFace.mood()));
     }
 
     delay(10);

@@ -14,12 +14,13 @@ set(CONFIG_LV_BUILD_EXAMPLES 0 CACHE BOOL "" FORCE)
 
 add_subdirectory(${LVGL_DIR} lvgl_build)
 
+find_package(SDL2 REQUIRED)
+target_include_directories(lvgl PUBLIC ${SDL2_INCLUDE_DIRS})
+
 add_executable(lvgl_sim
     main.cpp
     ${CAT_SRC_DIR}/cat_face.cpp
 )
-
-find_package(SDL2 REQUIRED)
 
 target_include_directories(lvgl_sim PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}/mock   # Arduino.h + Touch_CST816.h stubs (highest priority)

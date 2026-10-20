@@ -32,36 +32,51 @@ void lvgl_port_unlock(void) {
   }
 }
 
-static volatile bool _flush_skip = false;
-static volatile bool _touch_skip = false;
 static volatile uint32_t _lvglLoopCount = 0;
+static volatile uint32_t _frameCount    = 0;
+static volatile uint32_t _renderMaxMs   = 0;
 
 uint32_t lvgl_get_loop_count(void) { return _lvglLoopCount; }
+uint32_t lvgl_get_frame_count(void) { return _frameCount; }
 
-void lvgl_set_flush_skip(bool skip) { _flush_skip = skip; }
-void lvgl_set_touch_skip(bool skip) { _touch_skip = skip; }
+uint32_t lvgl_take_render_max_ms(void) {
+  uint32_t v = _renderMaxMs;
+  _renderMaxMs = 0;
+  return v;
+}
 
+static volatile bool    _touchPressed = false;
+static volatile int16_t _touchX = 0, _touchY = 0;
+
+bool lvgl_touch_pressed(int16_t *x, int16_t *y) {
+  if (x) *x = _touchX;
+  if (y) *y = _touchY;
+  return _touchPressed;
+}
+
+// The SPI master copies non-DMA-capable (PSRAM) buffers into internal RAM when
+// the transaction is queued, so the LVGL buffer can be released immediately.
 static void my_disp_flush(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map)
 {
-  if (!_flush_skip) {
-    LCD_addWindow(area->x1, area->y1, area->x2, area->y2, (uint16_t *)px_map);
-  }
+  lv_draw_sw_rgb565_swap(px_map, lv_area_get_size(area));
+  LCD_addWindow(area->x1, area->y1, area->x2, area->y2, (uint16_t *)px_map);
+  if (lv_display_flush_is_last(disp)) _frameCount++;
   lv_display_flush_ready(disp);
 }
 
 static void my_touchpad_read(lv_indev_t *indev_drv, lv_indev_data_t *data)
 {
-  if (_touch_skip) {
-    data->state = LV_INDEV_STATE_REL;
-    return;
-  }
   Touch_Read_Data();
   if (touch_data.points != 0x00) {
     data->point.x = touch_data.x;
     data->point.y = touch_data.y;
     data->state = LV_INDEV_STATE_PR;
+    _touchX = touch_data.x;
+    _touchY = touch_data.y;
+    _touchPressed = true;
   } else {
     data->state = LV_INDEV_STATE_REL;
+    _touchPressed = false;
   }
   touch_data.x = 0;
   touch_data.y = 0;
@@ -85,20 +100,21 @@ static void LVGL_Loop(void *parameter) {
 
     if (_update_cb) _update_cb();
 
-    bool isSkip = _flush_skip;
-
-    if (!isSkip) {
-      uint32_t t0 = millis();
-      lv_timer_handler();
-      uint32_t dt = millis() - t0;
-      if (dt > 2000) {
-        Serial.printf("[LVGL] WARN: lv_timer_handler stuck for %u ms!\n", (unsigned)dt);
-      }
+    uint32_t t0 = millis();
+    uint32_t untilNext = lv_timer_handler();
+    uint32_t dt = millis() - t0;
+    if (dt > _renderMaxMs) _renderMaxMs = dt;
+    if (dt > 2000) {
+      Serial.printf("[LVGL] WARN: lv_timer_handler stuck for %u ms!\n", (unsigned)dt);
     }
 
     _lvglLoopCount++;
     lvgl_port_unlock();
-    vTaskDelay(pdMS_TO_TICKS(isSkip ? 50 : 16));
+    // Sleep only until the next LVGL timer is due so a 16ms refresh period is
+    // not stretched to 16ms + render time; always yield at least one tick.
+    if (untilNext > 16) untilNext = 16;
+    if (untilNext < 1) untilNext = 1;
+    vTaskDelay(pdMS_TO_TICKS(untilNext));
   }
   vTaskDelete(NULL);
 }

@@ -34,6 +34,10 @@ bool           audioInputIsActive();
 // Returns true when VAD has detected silence long enough to auto-stop.
 bool           audioInputProcess();
 
+// RMS of the most recent 10ms chunk while recording; 0 when stopped.
+// Safe to read from any core.
+uint16_t       audioInputGetLevel();
+
 const uint8_t* audioInputGetBuffer();
 size_t         audioInputGetBytes();
 void           audioInputClear();

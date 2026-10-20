@@ -5,6 +5,7 @@
 #include <esp_heap_caps.h>
 #include <Arduino.h>
 #include <math.h>
+#include <atomic>
 
 // =============================================================
 //  V2 board I2S pins — shared bus for mic (ES7210) and speaker (ES8311)
@@ -26,6 +27,7 @@ static uint8_t  *_buf             = nullptr;
 static size_t    _bytes           = 0;
 static bool      _active          = false;
 static bool      _initOk          = false;
+static std::atomic<uint16_t> _level{0};
 
 // VAD state
 static uint32_t  _silenceStartMs  = 0;
@@ -163,6 +165,7 @@ void audioInputStart() {
 }
 
 void audioInputStop() {
+    _level = 0;
     if (!_active) return;
     _active = false;
     Serial.printf("[AudioIn] stopped — %u bytes / %.1f s\n",
@@ -199,6 +202,7 @@ bool audioInputProcess() {
         _bytes += monoBytes;
 
         int32_t r = rms(mono, frames);
+        _level = (uint16_t)(r > 0xFFFF ? 0xFFFF : r);
 
         // Hard time limit: force stop regardless of VAD state
         uint32_t now = millis();
@@ -243,6 +247,7 @@ bool audioInputProcess() {
     return false;
 }
 
+uint16_t       audioInputGetLevel()  { return _level.load(); }
 const uint8_t* audioInputGetBuffer() { return _buf; }
 size_t         audioInputGetBytes()   { return _bytes; }
 void           audioInputClear()      { _bytes = 0; }

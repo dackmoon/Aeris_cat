@@ -22,6 +22,10 @@ void Lvgl_Loop(void);
 bool lvgl_port_lock(uint32_t timeout_ms);
 void lvgl_port_unlock(void);
 void lvgl_set_update_cb(lvgl_update_cb_t cb);
-void lvgl_set_flush_skip(bool skip);
-void lvgl_set_touch_skip(bool skip);
+// Latest raw touch state from the LVGL input read (updated every indev period).
+bool lvgl_touch_pressed(int16_t *x, int16_t *y);
 uint32_t lvgl_get_loop_count(void);
+// Completed frames pushed to the LCD (counted on the last flush of each refresh).
+uint32_t lvgl_get_frame_count(void);
+// Longest single lv_timer_handler() call since the previous call; resets the max.
+uint32_t lvgl_take_render_max_ms(void);
