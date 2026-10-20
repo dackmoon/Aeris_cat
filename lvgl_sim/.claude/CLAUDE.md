@@ -24,11 +24,11 @@ cmake --build build --config Release
 # 启动模拟器
 ./build/Release/lvgl_sim
 
-# 截图模式：渲染 9 种状态拼成 grid.ppm 后退出（可选第二个参数为装饰掩码）
+# 截图模式：渲染 12 种状态拼成 grid.ppm 后退出（可选第二个参数为装饰掩码，默认 3=高光+腮红）
 ./build/Release/lvgl_sim --shots /tmp/catshots [decor]
 sips -s format png /tmp/catshots/grid.ppm --out grid.png
 
-# 装饰层对比：无 / 瞳孔 / 瞳孔+腮红 / 全部，各 5 种状态 → decor.ppm
+# 装饰层对比：高光+腮红 / 无 / 仅高光 / 全部，各 5 种状态 → decor.ppm
 ./build/Release/lvgl_sim --decor-shots /tmp/catshots
 ```
 
@@ -57,12 +57,13 @@ lvgl_sim/
 | 键 | 效果 |
 |----|------|
 | `1`–`5` | Activity：Idle / Listening / Thinking / Talking / Sleeping |
-| `Q W E R T` | Mood：Neutral / Happy / Curious / Confused / Surprised |
+| `Q W E R T` | 基础 Mood：Neutral / Happy / Curious / Confused / Surprised |
+| `A S F G` | 新增 Mood：`A` Love（害羞爱心）/ `S` Sad（委屈泪光）/ `F` Angry（傲娇生气）/ `G` Wink（俏皮眨眼） |
 | `Y` / `U` | 闪现 Surprised 0.4s / Confused 1.5s |
-| `D` | 装饰层循环：无 → 瞳孔 → 瞳孔+腮红 → 全部 |
-| `V` | 开关合成语音电平（驱动 Listening 放大、Talking 律动） |
-| `Z` | 开关犯困渐变（6s 从清醒到最困，仅 Idle） |
-| 鼠标按住 | 模拟手指按在屏幕上（眼睛微压、视线跟随） |
+| `D` | 装饰层循环：高光+腮红（默认）→ 无装饰 → 仅高光 → 全部（含小嘴） |
+| `V` | 开关合成语音电平（驱动 Listening 放大、Talking 音节拍点弹跳） |
+| `Z` | 开关犯困渐变（6s 从清醒到最困，可触发犯困点头猛醒小剧场） |
+| 鼠标按住 | 模拟手指按在屏幕上（眼睛体积守恒压扁、视线跟随手指） |
 | `ESC` | 退出 |
 
 ---

@@ -67,7 +67,7 @@ static bool     _silent     = false;
 static std::atomic<int>      _reqActivity{ACT_IDLE};
 static std::atomic<int>      _reqMood{MOOD_NEUTRAL};
 static std::atomic<int>      _reqDrowsy{0};          // 0..1000
-static std::atomic<int>      _reqDecor{DECOR_NONE};
+static std::atomic<int>      _reqDecor{DECOR_HIGHLIGHT | DECOR_BLUSH};
 static std::atomic<int>      _reqPulseMood{MOOD_NEUTRAL};
 static std::atomic<uint32_t> _reqPulseMs{0};
 static std::atomic<bool>     _reqPulse{false};
@@ -139,18 +139,19 @@ static void enterIdle() {
 }
 
 static void failToIdle(const char *why) {
-    Serial.printf("[Main] %s -> IDLE (confused)\n", why);
+    Serial.printf("[Main] %s -> IDLE (sad/confused)\n", why);
     cloudReset();
     enterIdle();
     faceMood(MOOD_NEUTRAL);
-    facePulse(MOOD_CONFUSED, 1500);
+    bool timeout = strstr(why, "Timeout") || strstr(why, "timeout");
+    facePulse(timeout ? MOOD_SAD : MOOD_CONFUSED, 2200);
     stressResult(false);
 }
 
 static void enterListening() {
     if (!wifiConnected()) {
         Serial.println("[Main] No WiFi — can't listen");
-        facePulse(MOOD_CONFUSED, 1500);
+        facePulse(MOOD_SAD, 2000);
         return;
     }
     setState(DIALOG_LISTENING);
@@ -173,8 +174,14 @@ static void enterThinking(const uint8_t *pcm, size_t bytes) {
 
 static CatMood emotionToMood(const char *emotion) {
     if (emotion) {
-        if (strcmp(emotion, "happy")    == 0) return MOOD_HAPPY;
-        if (strcmp(emotion, "thinking") == 0) return MOOD_CURIOUS;
+        if (strcmp(emotion, "happy")     == 0) return MOOD_HAPPY;
+        if (strcmp(emotion, "thinking")  == 0 || strcmp(emotion, "curious") == 0) return MOOD_CURIOUS;
+        if (strcmp(emotion, "love")      == 0 || strcmp(emotion, "shy")     == 0) return MOOD_LOVE;
+        if (strcmp(emotion, "sad")       == 0) return MOOD_SAD;
+        if (strcmp(emotion, "angry")     == 0) return MOOD_ANGRY;
+        if (strcmp(emotion, "wink")      == 0) return MOOD_WINK;
+        if (strcmp(emotion, "surprised") == 0) return MOOD_SURPRISED;
+        if (strcmp(emotion, "confused")  == 0) return MOOD_CONFUSED;
     }
     return MOOD_NEUTRAL;   // "neutral", "talking" or unknown
 }
@@ -213,9 +220,29 @@ static void wake() {
 // ============================================================
 //  Gestures — Core 1, dispatched by dialog state
 // ============================================================
+static uint32_t _lastPetMs       = 0;
+static uint8_t  _petStreak       = 0;
+static uint32_t _lastInterruptMs = 0;
+
 static void onTap() {
+    uint32_t now = millis();
     switch (dialogState) {
-    case DIALOG_IDLE:      facePulse(MOOD_HAPPY, 2000); break;
+    case DIALOG_IDLE:
+        if (now - _lastPetMs < 3500) _petStreak++;
+        else                         _petStreak = 1;
+        _lastPetMs = now;
+
+        if (_petStreak >= 5) {
+            // Poked too many times in a row -> tsundere angry!
+            facePulse(MOOD_ANGRY, 2200);
+            _petStreak = 0;
+        } else if (_petStreak >= 2) {
+            // Multiple gentle pets -> affectionate Love!
+            facePulse(MOOD_LOVE, 2800);
+        } else {
+            facePulse((random(0, 100) < 30) ? MOOD_WINK : MOOD_HAPPY, 2200);
+        }
+        break;
     case DIALOG_SLEEPING:  wake(); break;
     case DIALOG_LISTENING:
         audioInputStop();
@@ -226,7 +253,12 @@ static void onTap() {
         cloudReset();
         enterIdle();
         faceMood(MOOD_NEUTRAL);
-        facePulse(MOOD_SURPRISED, 400);
+        if (now - _lastInterruptMs < 15000) {
+            facePulse(MOOD_ANGRY, 2000);   // interrupted again -> annoyed!
+        } else {
+            facePulse(MOOD_SURPRISED, 500);
+        }
+        _lastInterruptMs = now;
         break;
     case DIALOG_THINKING:  break;
     }

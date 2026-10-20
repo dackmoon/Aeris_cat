@@ -18,9 +18,9 @@
 > 表情、动画、渲染相关的待办已整合进 [表情与动画改造方案](face-animation-redesign.md)。
 
 - [x] ESP32 端主循环状态机（IDLE → LISTENING → THINKING → TALKING → IDLE）
-- [x] 表情与语音同步（说话时眼睛律动，后端 emotion 驱动表情）
-- [x] 待机时随机行为（眨眼、看向，120s 无操作进入 Sleepy）
-- [ ] 删除 `flush_skip` / `touch_skip` 机制，让 LVGL 在 THINKING/TALKING 期间正常渲染
+- [x] 表情与语音同步（说话时双包络提取音节拍点驱动眼睛弹跳，后端 emotion 驱动情绪）
+- [x] 待机时随机行为（眨眼、扫视、5 种自主微表情小剧场，75s 渐困、120s 入睡）
+- [x] 删除 `flush_skip` / `touch_skip` 机制，片上 DMA SRAM 双缓冲 + LUT 扫描线光栅化，全状态稳定 70~83fps
 - [ ] 设备端重构：拆为 4 个 FreeRTOS Task（LVGL / State Machine / Audio / Cloud），volatile flag → Queue
 - [ ] 后端 `/chat` 增加 `transcript` 字段，修复 Phase 5 模式下 `[你]` 用户字幕不显示
 - [ ] 情绪分析升级为 LLM 分类（替代规则匹配）

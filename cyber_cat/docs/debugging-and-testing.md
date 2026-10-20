@@ -22,7 +22,7 @@ Phase 4 调试 LVGL 死循环后建立，永久保留。
 
 健康报告示例：
 ```
-[Health] main=8721 lvgl=12697 heap=7484008 psram=7292716 ds=Idle wifi=1 fps=31.7 render_max=19ms face=Idle/Happy
+[Health] main=5810 lvgl=8992 heap=7520404 psram=7347540 ds=Idle wifi=1 fps=83.3 render_max=13ms face=Idle/Wink
 ```
 
 | 字段 | 含义 |
@@ -31,8 +31,8 @@ Phase 4 调试 LVGL 死循环后建立，永久保留。
 | `heap` / `psram` | 剩余堆内存（含 PSRAM）/ 其中 PSRAM 部分 |
 | `ds` | 对话状态：Idle / Listening / Thinking / Talking / Sleeping |
 | `wifi` | 1 = 已连接 |
-| `fps` | 过去 10s 实际推到屏幕的帧数 / 秒。只有画面变化时才刷屏，静止时（只有呼吸、偶尔眨眼）10 左右是正常的；眼睛连续运动时约 30~40 |
-| `render_max` | 过去 10s 内单次 `lv_timer_handler()` 的最长耗时 |
+| `fps` | 过去 10s 实际推到屏幕的帧数 / 秒。v3 引擎下由于亚像素呼吸与连续微动，全状态稳定在 **70 ~ 83.3 fps** |
+| `render_max` | 过去 10s 内单次 `lv_timer_handler()` 的最长耗时（常规 12~18ms，字幕刷新时约 29ms） |
 | `face` | 当前表情的 Activity / Mood |
 
 ## 串口调试命令
@@ -42,9 +42,9 @@ Phase 4 调试 LVGL 死循环后建立，永久保留。
 | 命令 | 作用 |
 |------|------|
 | `act <n>` | 强制表情的对话状态：0 Idle、1 Listening、2 Thinking、3 Talking、4 Sleeping（下次状态切换时被覆盖） |
-| `mood <n>` | 设置情绪：0 Neutral、1 Happy、2 Curious、3 Confused、4 Surprised |
-| `pulse <n>` | 短暂闪现某个情绪 1.5s |
-| `decor <mask>` | 装饰层：1 瞳孔、2 腮红、4 小嘴，可相加（7 = 全部，0 = 关闭） |
+| `mood <n>` | 设置情绪（0–8）：0 Neutral、1 Happy、2 Curious、3 Confused、4 Surprised、5 Love、6 Sad、7 Angry、8 Wink |
+| `pulse <n>` | 短暂闪现某个情绪 1.5s（0–8） |
+| `decor <mask>` | 装饰层掩码：1 高光块、2 赛博腮红 `///`、4 小嘴 `ω`，可相加（默认 3 = 高光+腮红，7 = 全部，0 = 关闭） |
 | `tap` / `hold` | 模拟点击 / 长按 |
 | `silent <0/1>` | 1 = 功放保持关闭（深夜测试用） |
 | `chat` | 用内置语音样本走一遍完整对话（使用 `test-<MAC>` 会话，不写入猫的真实记忆） |
@@ -62,8 +62,8 @@ pio device monitor -b 115200   # 然后输入 stress 12
 
 `../lvgl_sim/` 在 Mac 上直接编译 `src/cat_face.cpp`，调表情不用烧录。构建方法与按键见 `lvgl_sim/.claude/CLAUDE.md`。
 
-- `./build/Release/lvgl_sim --shots <dir> [decor]`：渲染 9 种状态到 `<dir>/grid.ppm`，见 [v2 表情总览](img/expressions-v2.png)（改造前见 [基线图](img/baseline-expressions.png)）
-- `./build/Release/lvgl_sim --decor-shots <dir>`：渲染装饰层四档对比到 `<dir>/decor.ppm`，见 [装饰对比](img/decor-variants.png)
+- `./build/Release/lvgl_sim --shots <dir> [decor]`：渲染 12 种状态到 `<dir>/grid.ppm`，见 [v3 赛博表情总览](img/expressions-v3-cyber.png)（早期版本见 [v2 图](img/expressions-v2.png)、[v1 基线图](img/baseline-expressions.png)）
+- `./build/Release/lvgl_sim --decor-shots <dir>`：渲染装饰层四档对比到 `<dir>/decor.ppm`，见 [v3 装饰对比](img/decor-v3-cyber.png)
 
 截图模式会关闭随机眨眼和扫视，保证每次输出一致。
 

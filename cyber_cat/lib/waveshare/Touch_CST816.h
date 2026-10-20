@@ -30,6 +30,7 @@ enum GESTURE {
 #define CST816_REG_DisAutoSleep 0xFE
 
 extern struct CST816_Touch touch_data;
+extern volatile uint8_t Touch_interrupts;
 
 struct CST816_Touch {
   uint8_t points;

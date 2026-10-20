@@ -54,33 +54,46 @@ bool lvgl_touch_pressed(int16_t *x, int16_t *y) {
   return _touchPressed;
 }
 
-// The SPI master copies non-DMA-capable (PSRAM) buffers into internal RAM when
-// the transaction is queued, so the LVGL buffer can be released immediately.
+static lv_display_t *s_disp = NULL;
+
+static void IRAM_ATTR on_lcd_dma_done(void) {
+  if (s_disp) lv_display_flush_ready(s_disp);
+}
+
+// Asynchronous QSPI DMA flush: `lv_display_flush_ready` is signaled from the
+// SPI DMA completion ISR (`on_color_trans_done`) so LVGL never overwrites an
+// internal SRAM draw buffer while QSPI DMA is still transmitting it.
 static void my_disp_flush(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map)
 {
   lv_draw_sw_rgb565_swap(px_map, lv_area_get_size(area));
-  LCD_addWindow(area->x1, area->y1, area->x2, area->y2, (uint16_t *)px_map);
   if (lv_display_flush_is_last(disp)) _frameCount++;
-  lv_display_flush_ready(disp);
+  LCD_addWindow(area->x1, area->y1, area->x2, area->y2, (uint16_t *)px_map);
 }
 
 static void my_touchpad_read(lv_indev_t *indev_drv, lv_indev_data_t *data)
 {
-  Touch_Read_Data();
-  if (touch_data.points != 0x00) {
-    data->point.x = touch_data.x;
-    data->point.y = touch_data.y;
-    data->state = LV_INDEV_STATE_PR;
-    _touchX = touch_data.x;
-    _touchY = touch_data.y;
-    _touchPressed = true;
+  // Only perform an I2C read when CST816 signals an interrupt or a finger is
+  // currently held down. Avoids a blocking I2C transaction on every idle frame.
+  if (Touch_interrupts || _touchPressed || digitalRead(CST816_INT_PIN) == LOW) {
+    Touch_interrupts = 0;
+    Touch_Read_Data();
+    if (touch_data.points != 0x00) {
+      data->point.x = touch_data.x;
+      data->point.y = touch_data.y;
+      data->state = LV_INDEV_STATE_PR;
+      _touchX = touch_data.x;
+      _touchY = touch_data.y;
+      _touchPressed = true;
+    } else {
+      data->state = LV_INDEV_STATE_REL;
+      _touchPressed = false;
+    }
+    touch_data.x = 0;
+    touch_data.y = 0;
+    touch_data.points = 0;
   } else {
     data->state = LV_INDEV_STATE_REL;
-    _touchPressed = false;
   }
-  touch_data.x = 0;
-  touch_data.y = 0;
-  touch_data.points = 0;
 }
 
 static uint32_t my_tick(void) {
@@ -110,9 +123,9 @@ static void LVGL_Loop(void *parameter) {
 
     _lvglLoopCount++;
     lvgl_port_unlock();
-    // Sleep only until the next LVGL timer is due so a 16ms refresh period is
-    // not stretched to 16ms + render time; always yield at least one tick.
-    if (untilNext > 16) untilNext = 16;
+    // Sleep only until the next LVGL timer is due so a 12ms refresh period is
+    // not stretched by render time; always yield at least 1ms tick for IDLE0.
+    if (untilNext > 12) untilNext = 12;
     if (untilNext < 1) untilNext = 1;
     vTaskDelay(pdMS_TO_TICKS(untilNext));
   }
@@ -122,15 +135,20 @@ static void LVGL_Loop(void *parameter) {
 void Lvgl_Init(void) {
   lvgl_port_lock_init();
 
-  // Partial render: 1/10 screen stripe (~26 KB each) instead of full frame (259 KB each)
+  // Allocate partial draw buffers in internal DMA-capable SRAM (~25.9 KB each)
+  // for fast CPU scanline rendering and zero-copy QSPI DMA transfers.
   bufSize = LVGL_BUF_LEN;
-  disp_draw_buf1 = (lv_color_t *)heap_caps_malloc(bufSize * 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-  disp_draw_buf2 = (lv_color_t *)heap_caps_malloc(bufSize * 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  disp_draw_buf1 = (lv_color_t *)heap_caps_malloc(bufSize * 2, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+  disp_draw_buf2 = (lv_color_t *)heap_caps_malloc(bufSize * 2, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+  if (!disp_draw_buf1) disp_draw_buf1 = (lv_color_t *)heap_caps_malloc(bufSize * 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!disp_draw_buf2) disp_draw_buf2 = (lv_color_t *)heap_caps_malloc(bufSize * 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 
   lv_init();
   lv_tick_set_cb(my_tick);
 
   lv_display_t *disp = lv_display_create(LCD_WIDTH, LCD_HEIGHT);
+  s_disp = disp;
+  LCD_SetFlushDoneCallback(on_lcd_dma_done);
   lv_display_set_flush_cb(disp, my_disp_flush);
   lv_display_set_buffers(disp, disp_draw_buf1, disp_draw_buf2, bufSize * 2, LV_DISPLAY_RENDER_MODE_PARTIAL);
 

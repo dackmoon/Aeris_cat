@@ -1,18 +1,19 @@
 // ============================================================
-//  Cyber Cat — LVGL Desktop Simulator
+//  Cyber Cat — LVGL Desktop Simulator (v3 Cyber Scanline Engine)
 //  360×360 window, simulates ESP32-S3 round screen
 //
 //  Keyboard controls:
 //    1-5        activity: Idle / Listening / Thinking / Talking / Sleeping
 //    Q W E R T  mood: Neutral / Happy / Curious / Confused / Surprised
-//    Y          pulse Surprised (0.4s)        U  pulse Confused (1.5s)
-//    D          cycle decoration: none → pupils → pupils+blush → all
+//    A S F G    mood: Love / Sad / Angry / Wink
+//    Y / U      pulse Surprised (0.4s) / Confused (1.5s)
+//    D          cycle decoration: highlight+blush → none → highlight → all
 //    V          toggle synthetic voice level (drives Listening / Talking)
 //    Z          toggle drowsiness ramp (0 → 1 over 6s, Idle only)
 //    Mouse      press and hold = finger on screen
 //    ESC        quit
 //
-//  ./lvgl_sim --shots <dir> [decor]  renders every state to <dir>/grid.ppm
+//  ./lvgl_sim --shots <dir> [decor]  renders 12-panel state showcase to <dir>/grid.ppm
 //  ./lvgl_sim --decor-shots <dir>    renders decoration variants to <dir>/decor.ppm
 // ============================================================
 #include "lvgl.h"
@@ -34,7 +35,12 @@ CST816_Touch touch_data;
 #define DISP_H  360
 static const float ZOOM = 1.5f;
 
-static const uint8_t DECOR_CYCLE[] = {DECOR_NONE, DECOR_PUPILS, DECOR_PUPILS | DECOR_BLUSH, DECOR_ALL};
+static const uint8_t DECOR_CYCLE[] = {
+    DECOR_HIGHLIGHT | DECOR_BLUSH,
+    DECOR_NONE,
+    DECOR_HIGHLIGHT,
+    DECOR_ALL,
+};
 
 static lv_obj_t *g_label = nullptr;
 static bool      g_voice = false;
@@ -49,12 +55,12 @@ static void updateLabel() {
     lv_label_set_text(g_label, buf);
 }
 
-// Syllable-like level: ~4 bursts per second with random gaps.
+// Syllable-like level: ~4 bursts per second with dynamic accent so onset beat triggers.
 static uint16_t syntheticVoice(uint32_t now) {
     float t = now / 1000.0f;
-    float syll = 0.5f + 0.5f * sinf(t * 2 * 3.14159f * 4.0f);
+    float syll = 0.5f + 0.5f * sinf(t * 2 * 3.14159f * 4.2f);
     float phrase = sinf(t * 2 * 3.14159f * 0.35f) > -0.3f ? 1.0f : 0.0f;
-    return (uint16_t)(syll * syll * phrase * 4500);
+    return (uint16_t)(syll * syll * syll * phrase * 4500);
 }
 
 static void feedInputs() {
@@ -87,6 +93,10 @@ static bool handleEvents() {
         case SDLK_e: catFace.setMood(MOOD_CURIOUS);   break;
         case SDLK_r: catFace.setMood(MOOD_CONFUSED);  break;
         case SDLK_t: catFace.setMood(MOOD_SURPRISED); break;
+        case SDLK_a: catFace.setMood(MOOD_LOVE);      break;
+        case SDLK_s: catFace.setMood(MOOD_SAD);       break;
+        case SDLK_f: catFace.setMood(MOOD_ANGRY);     break;
+        case SDLK_g: catFace.setMood(MOOD_WINK);      break;
         case SDLK_y: catFace.pulseMood(MOOD_SURPRISED, 400);  break;
         case SDLK_u: catFace.pulseMood(MOOD_CONFUSED, 1500);  break;
         case SDLK_d:
@@ -113,7 +123,7 @@ static void runFor(uint32_t ms) {
         SDL_Event e;
         while (SDL_PollEvent(&e)) {}
         lv_timer_handler();
-        usleep(5 * 1000);
+        usleep(4 * 1000);
     }
 }
 
@@ -146,13 +156,26 @@ static bool blitScreen(uint8_t *canvas, int canvasW, int ox, int oy) {
 struct Shot { CatActivity act; CatMood mood; uint16_t voice; };
 
 static const Shot STATE_SHOTS[] = {
-    {ACT_IDLE, MOOD_NEUTRAL, 0},   {ACT_IDLE, MOOD_HAPPY, 0},     {ACT_IDLE, MOOD_CURIOUS, 0},
-    {ACT_IDLE, MOOD_CONFUSED, 0},  {ACT_IDLE, MOOD_SURPRISED, 0}, {ACT_LISTENING, MOOD_NEUTRAL, 1500},
-    {ACT_THINKING, MOOD_NEUTRAL, 0}, {ACT_TALKING, MOOD_NEUTRAL, 3000}, {ACT_SLEEPING, MOOD_NEUTRAL, 0},
+    {ACT_IDLE,      MOOD_NEUTRAL,   0},
+    {ACT_IDLE,      MOOD_HAPPY,     0},
+    {ACT_IDLE,      MOOD_CURIOUS,   0},
+    {ACT_IDLE,      MOOD_CONFUSED,  0},
+    {ACT_IDLE,      MOOD_SURPRISED, 0},
+    {ACT_IDLE,      MOOD_LOVE,      0},
+    {ACT_IDLE,      MOOD_SAD,       0},
+    {ACT_IDLE,      MOOD_ANGRY,     0},
+    {ACT_IDLE,      MOOD_WINK,      0},
+    {ACT_LISTENING, MOOD_NEUTRAL,   1800},
+    {ACT_THINKING,  MOOD_NEUTRAL,   0},
+    {ACT_SLEEPING,  MOOD_NEUTRAL,   0},
 };
+
 static const Shot DECOR_SHOTS[] = {
-    {ACT_IDLE, MOOD_NEUTRAL, 0}, {ACT_IDLE, MOOD_HAPPY, 0}, {ACT_LISTENING, MOOD_NEUTRAL, 1500},
-    {ACT_THINKING, MOOD_NEUTRAL, 0}, {ACT_TALKING, MOOD_HAPPY, 3000},
+    {ACT_IDLE,      MOOD_NEUTRAL, 0},
+    {ACT_IDLE,      MOOD_HAPPY,   0},
+    {ACT_IDLE,      MOOD_LOVE,    0},
+    {ACT_THINKING,  MOOD_NEUTRAL, 0},
+    {ACT_TALKING,   MOOD_HAPPY,   3200},
 };
 
 static void applyShot(const Shot &s) {
@@ -161,23 +184,22 @@ static void applyShot(const Shot &s) {
     catFace.setSpeechLevel(s.voice);
     catFace.setListenLevel(s.voice);
     updateLabel();
-    runFor(1500);
+    runFor(1100);
     printf("  shot %s / %s\n", catActivityName(s.act), catMoodName(s.mood));
     fflush(stdout);
 }
 
-// Renders `n` shots for each decoration mask (one row per mask) into one grid.
 static int renderGrid(const char *path, const Shot *shots, int n, int cols,
-                      const uint8_t *decors, int rowsPerDecor) {
+                      const uint8_t *decors, int rows) {
     const int GAP = 6;
-    int rows = rowsPerDecor;
     int gw = cols * DISP_W + (cols - 1) * GAP;
     int gh = rows * DISP_H + (rows - 1) * GAP;
     uint8_t *grid = (uint8_t *)malloc((size_t)gw * gh * 3);
-    memset(grid, 0x40, (size_t)gw * gh * 3);
+    memset(grid, 0x22, (size_t)gw * gh * 3);
 
     int cell = 0;
-    for (int r = 0; r < (decors ? rowsPerDecor : 1); r++) {
+    int passes = decors ? rows : 1;
+    for (int r = 0; r < passes; r++) {
         if (decors) catFace.setDecor(decors[r]);
         for (int i = 0; i < n; i++, cell++) {
             applyShot(shots[i]);
@@ -194,7 +216,7 @@ static int renderGrid(const char *path, const Shot *shots, int n, int cols,
 
 int main(int argc, char **argv) {
     const char *shotsDir = nullptr, *decorDir = nullptr;
-    uint8_t shotDecor = DECOR_NONE;
+    uint8_t shotDecor = DECOR_HIGHLIGHT | DECOR_BLUSH;
     if (argc >= 3 && strcmp(argv[1], "--shots") == 0) {
         shotsDir = argv[2];
         if (argc >= 4) shotDecor = (uint8_t)atoi(argv[3]);
@@ -204,14 +226,14 @@ int main(int argc, char **argv) {
 
     lv_init();
     lv_display_t *disp = lv_sdl_window_create(DISP_W, DISP_H);
-    lv_sdl_window_set_title(disp, "Cyber Cat Simulator");
+    lv_sdl_window_set_title(disp, "Cyber Cat Simulator (v3 Cyber Scanline)");
     lv_sdl_window_set_zoom(disp, ZOOM);
 
     lv_obj_t *scr = lv_screen_active();
     catFace.create(scr);
 
     g_label = lv_label_create(scr);
-    lv_obj_set_style_text_color(g_label, lv_color_hex(0x888888), 0);
+    lv_obj_set_style_text_color(g_label, lv_color_hex(0x688898), 0);
     lv_obj_align(g_label, LV_ALIGN_BOTTOM_MID, 0, -20);
     updateLabel();
 
@@ -220,7 +242,7 @@ int main(int argc, char **argv) {
         catFace.setAutoBehaviours(false);
         catFace.setDecor(shotDecor);
         snprintf(path, sizeof(path), "%s/grid.ppm", shotsDir);
-        return renderGrid(path, STATE_SHOTS, 9, 3, nullptr, 3);
+        return renderGrid(path, STATE_SHOTS, 12, 4, nullptr, 3);
     }
     if (decorDir) {
         catFace.setAutoBehaviours(false);
@@ -228,8 +250,8 @@ int main(int argc, char **argv) {
         return renderGrid(path, DECOR_SHOTS, 5, 5, DECOR_CYCLE, (int)sizeof(DECOR_CYCLE));
     }
 
-    printf("=== Cyber Cat Simulator ===\n");
-    printf("  1-5 activity | QWERT mood | Y/U pulse | D decor | V voice | Z drowsy | mouse touch\n");
+    printf("=== Cyber Cat Simulator (v3 Cyber Scanline) ===\n");
+    printf("  1-5 activity | QWERT + ASFG mood | Y/U pulse | D decor | V voice | Z drowsy | mouse touch\n");
 
     while (handleEvents()) {
         feedInputs();

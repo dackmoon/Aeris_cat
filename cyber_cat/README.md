@@ -67,11 +67,11 @@ pio run -t clean             # 清理构建产物
 | [docs/architecture.md](docs/architecture.md) | 整体架构图、云端 API 选型、代码目录结构 |
 | [docs/roadmap.md](docs/roadmap.md) | 开发路线总览 + Phase 6 待办 |
 | [docs/phase1-hardware.md](docs/phase1-hardware.md) | Phase 1 硬件基础：驱动移植、硬件验证结果 |
-| [docs/phase2-cat-face.md](docs/phase2-cat-face.md) | Phase 2 猫脸表情：表情参数、动画系统、状态机、触摸交互 |
+| [docs/phase2-cat-face.md](docs/phase2-cat-face.md) | Phase 2 猫脸表情（v3 赛博扫描线引擎）：9 种情绪、物理弹簧、83fps 光栅化、触摸交互 |
 | [docs/phase3-cloud.md](docs/phase3-cloud.md) | Phase 3 云端通信：HTTP 客户端、WiFi 重连、稳定性修复 |
 | [docs/phase4-voice.md](docs/phase4-voice.md) | Phase 4 语音管道：录音/VAD、STT/TTS、ES7210/ES8311 音频架构、API 配置 |
 | [docs/phase5-backend.md](docs/phase5-backend.md) | Phase 5 后端服务：`/chat` 接口合约、记忆策略、部署 |
 | [docs/debugging-and-testing.md](docs/debugging-and-testing.md) | 串口日志、健康报告诊断框架、板上集成测试 |
-| [docs/face-animation-redesign.md](docs/face-animation-redesign.md) | 表情与动画改造方案（review 问题清单 + 分阶段计划，待实施） |
+| [docs/face-animation-redesign.md](docs/face-animation-redesign.md) | 表情与动画改造方案及 v2/v3 实测结果 |
 
 各 Phase 文档末尾均有**踩坑记录**，排查问题时优先查阅。

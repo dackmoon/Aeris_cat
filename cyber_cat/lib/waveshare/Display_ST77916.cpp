@@ -209,6 +209,18 @@ static void ST7701_Reset() {
 }
 
 esp_lcd_panel_handle_t panel_handle = NULL;
+static void (*s_flush_done_cb)(void) = NULL;
+
+void LCD_SetFlushDoneCallback(void (*cb)(void)) {
+  s_flush_done_cb = cb;
+}
+
+static bool IRAM_ATTR on_color_trans_done_isr(esp_lcd_panel_io_handle_t panel_io,
+                                              esp_lcd_panel_io_event_data_t *edata,
+                                              void *user_ctx) {
+  if (s_flush_done_cb) s_flush_done_cb();
+  return false;
+}
 
 static int QSPI_Init(void) {
   static const spi_bus_config_t host_config = {
@@ -278,6 +290,7 @@ static int QSPI_Init(void) {
   }
 
   io_config.pclk_hz = ESP_PANEL_LCD_SPI_CLK_HZ;
+  io_config.on_color_trans_done = on_color_trans_done_isr;
   if (esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)ESP_PANEL_HOST_SPI_ID_DEFAULT, &io_config, &io_handle) != ESP_OK) {
     printf("Failed to set LCD communication parameters -- SPI\r\n");
     return 0;
@@ -332,7 +345,9 @@ void LCD_addWindow(uint16_t Xstart, uint16_t Ystart, uint16_t Xend, uint16_t Yen
     Xend = EXAMPLE_LCD_WIDTH;
   if (Yend > EXAMPLE_LCD_HEIGHT)
     Yend = EXAMPLE_LCD_HEIGHT;
-  esp_lcd_panel_draw_bitmap(panel_handle, Xstart, Ystart, Xend, Yend, color);
+  if (esp_lcd_panel_draw_bitmap(panel_handle, Xstart, Ystart, Xend, Yend, color) != ESP_OK) {
+    if (s_flush_done_cb) s_flush_done_cb();
+  }
 }
 
 uint8_t LCD_Backlight = 50;

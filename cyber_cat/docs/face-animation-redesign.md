@@ -2,7 +2,7 @@
 
 [← 返回 README](../README.md) · [开发路线](roadmap.md)
 
-> 状态：阶段 0–4 与 3.5 已实施（2026-10-20），结果与遗留项见 5.2 节。
+> 状态：v2（阶段 0–4 与 3.5）于 2026-10-20 实施，v3（Cozmo 赛博几何扫描线引擎 + 83fps 高帧率管线）于 2026-10-21 完成并合入真机。详见 5.2 与 5.3 节。
 > 范围：`src/cat_face.*`、`src/main.cpp` 中与表情/状态相关的部分、`lib/waveshare/LVGL_Driver.cpp` 与 `Display_ST77916.cpp` 的渲染链路。
 
 ## 1. 目标
@@ -294,6 +294,37 @@ Mood（由后端 emotion 和交互驱动，有衰减）
 - **R3 不成立**：SPI master 在排队时会把 PSRAM 缓冲区拷贝到内部 RAM，LVGL 提前复用缓冲区不会改写正在发送的数据
 
 额外发现（后端，SSH 到 `Tencent_cloud` 查日志确认）：设备偶发的 `read Timeout` 与会话无关。后端 `/chat` 依次串行调用 SiliconFlow 的 STT → LLM → TTS，单次耗时实测 3.5–9.6s，偶尔超过 15s（日志中有一次 STT 上游 `httpx.ReadTimeout`，30s 后返回 500）。固件 `HTTP_TIMEOUT_MS` 是 15s，长尾请求会先在设备端超时，后端随后仍返回 200。
+
+### 5.3 v3 赛博扫描线表情引擎与 83fps 性能优化（2026-10-21）
+
+针对 v2 在真机上"几何切割感太硬、缺乏灵动细节"以及"连续运动只有 30–40fps"两个问题，进一步完成了 v3 升级（当前运行版本，详见 [phase2-cat-face.md](phase2-cat-face.md)）：
+
+![v3 赛博几何扫描线表情总览](img/expressions-v3-cyber.png)
+
+1. **视觉与造型升级（圆润大眼 + 双圆高光 + 纯净无条纹）**：
+   - 全部表情改为 **100% 纯圆 / 椭圆轮廓**（`dyCircle = hh * sqrt(1 - u^2)`），眼内配备**一大一小两颗圆高光点**（以 6.2Hz 欠阻尼弹簧做次级跟随运动）。`Curious` / `Confused` / `Thinking` 均采用一大一小双圆眼组合，彻底去掉了把眼睛切成方形的上下平直遮罩；`Sad` / `Angry` 用多项式平滑极值 `smaxf` 对眼睑交界做圆角过渡。
+   - **彻底消除黑条纹**：去掉了水平扫描线隔行压暗与斜线腮红间隙，改为**纯净实心抗锯齿填充 + 柔和二次衰减椭圆粉腮红**；同时修复了片上 DMA SRAM 双缓冲下 `my_disp_flush` 提前释放缓冲区导致 QSPI DMA 传输途中被清屏黑底覆盖的水平黑条纹撕裂 bug（现由 `Display_ST77916.cpp` 的 `on_color_trans_done` DMA 完成中断通知 `lv_display_flush_ready`）。
+2. **动态物理与自主生命感**：
+   - 加入**体积守恒挤压拉伸**、**大角度扫视联动半眨眼 + 速度惯性斜切**、**快慢双包络音节起音拍点（Syllable Onset Beat）**弹跳，以及 5 段**待机自主微表情小剧场**（左右张望、歪头挑眉、满足眯眼、警觉竖眼、犯困钓鱼猛醒）。
+3. **30fps → 83.3fps 的 5 项底层优化**：
+   - **片上 DMA SRAM 双缓冲**：`disp_draw_buf1/2`（各 25.9KB）从外部慢速 PSRAM 迁入 `MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA` 片上 SRAM。
+   - **去掉后台 `swdraw` 渲染线程**：`lv_conf.h` 中 `LV_USE_OS` 设为 `LV_OS_NONE`，刷新周期设为 `12ms`。
+   - **触摸 I2C 400kHz + 中断按需读取**：`I2C_Init` 启用 400kHz，`my_touchpad_read()` 仅在 `Touch_interrupts` 触发或手指按住时才发起 I2C 读取，平时耗时 0µs。
+   - **LUT 加速单遍列扫描光栅化**：每只眼预计算 `lut565[3][16]`（3 种扫描线亮度 × 16 级覆盖度）RGB565 查找表，内部实心区域零浮点指针直写，腮红改用全整数运算。
+   - **左右眼独立局部脏区**：将腮红并入左右眼各自包围盒，避免横跨全屏的无效刷新。
+
+**v3 真机实测帧率（`[Health]` 10s 统计窗口）**：
+
+| 状态 / 情绪 | v2 fps | v3 fps | v3 render_max |
+|-------------|--------|--------|---------------|
+| `Idle / Neutral` | 15–30 | **70.5 – 83.2** | 14ms |
+| `Idle / Happy` | ~31 | **83.3** | 13ms |
+| `Idle / Love`（含爱心+腮红+摇晃） | — | **71.2** | 18ms |
+| `Idle / Sad`（含动态水波泪光） | — | **74.5** | 18ms |
+| `Idle / Angry`（含高频微颤） | — | **83.3** | 12ms |
+| `Idle / Wink` | — | **83.3** | 13ms |
+| `Listening / Thinking` | 14–21 | **83.2** | 13–14ms |
+| `Talking`（TTS 播放 + 字幕同屏） | 26–31 | **81.2** | 29ms |
 
 ## 6. 验证方法
 

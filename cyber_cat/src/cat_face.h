@@ -12,47 +12,62 @@ enum CatActivity : uint8_t {
     ACT_COUNT
 };
 
-// How the cat feels — sets the eye shape; layered on top of any activity.
+// How the cat feels — sets the eye shape & cyber color; layered on any activity.
 enum CatMood : uint8_t {
     MOOD_NEUTRAL = 0,
     MOOD_HAPPY,
     MOOD_CURIOUS,
     MOOD_CONFUSED,
     MOOD_SURPRISED,
+    MOOD_LOVE,       // bashful / affectionate (pink cyber glow + blush + sway)
+    MOOD_SAD,        // wronged / sad (drooping outer corners + shimmering tear)
+    MOOD_ANGRY,      // tsundere / angry (sharp inner slant + coral-red + tremor)
+    MOOD_WINK,       // playful wink / smug (> o)
     MOOD_COUNT
 };
 
 // Optional decoration layers (bit mask).
 enum : uint8_t {
-    DECOR_NONE   = 0,
-    DECOR_PUPILS = 1 << 0,
-    DECOR_BLUSH  = 1 << 1,
-    DECOR_MOUTH  = 1 << 2,
-    DECOR_ALL    = DECOR_PUPILS | DECOR_BLUSH | DECOR_MOUTH,
+    DECOR_NONE      = 0,
+    DECOR_HIGHLIGHT = 1 << 0,   // secondary-motion cyber specular highlight inside eyes
+    DECOR_BLUSH     = 1 << 1,   // cyber slash blush "///" under the eyes
+    DECOR_MOUTH     = 1 << 2,   // small cyber mouth
+    DECOR_PUPILS    = DECOR_HIGHLIGHT, // alias for backward compatibility
+    DECOR_ALL       = DECOR_HIGHLIGHT | DECOR_BLUSH | DECOR_MOUTH,
 };
 
 const char *catActivityName(CatActivity a);
 const char *catMoodName(CatMood m);
 
-// Procedural cat face. Every eye parameter follows its target through a damped
-// spring, so any change of activity/mood mid-animation stays continuous.
+// Cozmo / Vector style procedural cyber face with scanline SDF rasterizer.
 // All methods must be called with the LVGL lock held (LVGL task / update cb).
 class CatFace {
 public:
     struct Spring {
         float x = 0, v = 0, target = 0;
-        float freq = 4.0f, damp = 0.8f;
+        float freq = 4.5f, damp = 0.75f;
         void step(float dt);
         void snap(float value) { x = target = value; v = 0; }
     };
 
-    enum Param : uint8_t { P_DX, P_DY, P_W, P_H, P_LID, P_TILT, P_BOT, P_COUNT };
+    enum Param : uint8_t {
+        P_DX = 0,
+        P_DY,
+        P_W,
+        P_H,
+        P_CORNER,    // corner roundness 0.15 (boxy) .. 0.48 (capsule/circle)
+        P_TOP_LID,   // upper lid cover 0..1
+        P_TOP_TILT,  // + lowers inner corner (\ /), - lowers outer corner (/ \)
+        P_BOT_LID,   // lower lid cover 0..1
+        P_BEND,      // centerline parabolic bend in px: + arches up (∩), - bows down (︶)
+        P_COUNT
+    };
 
-    // Eye pose relative to the eye's home position. lid: upper-lid cover 0..1;
-    // tilt: + lowers the inner corner of the upper lid; bot: lower-lid push 0..1.
-    struct Pose { float dx, dy, w, h, lid, tilt, bot; };
+    struct Pose {
+        float dx, dy, w, h, corner, topLid, topTilt, botLid, bend;
+    };
 
-    void create(lv_obj_t *parent);   // also starts the internal 16ms tick timer
+    void create(lv_obj_t *parent);
 
     void setActivity(CatActivity a);
     void setMood(CatMood m);
@@ -62,7 +77,7 @@ public:
     void setListenLevel(uint16_t rms);        // microphone level while listening
     void setTouch(bool pressed, int16_t x, int16_t y);
     void setDecor(uint8_t mask);
-    // Tooling (simulator snapshots): disable random blinks and glances.
+    // Tooling (simulator snapshots): disable random blinks, glances, and idle clips.
     void setAutoBehaviours(bool on) { _auto = on; }
 
     CatActivity activity() const { return _activity; }
@@ -70,18 +85,23 @@ public:
     uint8_t     decor() const { return _decor; }
 
 private:
-    struct EyeGeom {
-        int16_t x1, y1, x2, y2;     // eye white bounds
-        int16_t lidOuter, lidInner; // upper-lid edge y at outer / inner side
-        int16_t botCy, botR;        // lower-lid circle (botR = 0: none)
-        int16_t px, py, pr;         // pupil (pr = 0: none)
-        bool operator!=(const EyeGeom &o) const;
+    // Autonomous micro-behaviour clips in ACT_IDLE
+    enum IdleClip : uint8_t {
+        CLIP_NONE = 0,
+        CLIP_LOOK_AROUND,   // glance side -> pause -> opposite side -> center
+        CLIP_CURIOUS_PEEK,  // single-brow squint + head tilt
+        CLIP_HAPPY_SQUINT,  // contented slow-blink smile
+        CLIP_ALERT_PERK,    // quick ear-perk widen + upward dart
+        CLIP_DROWSY_NOD,    // droop eyelids -> jerk awake -> droop again
     };
-    struct DecorGeom {
-        int16_t blushDx, blushDy;
-        uint8_t blushOpa;
-        int16_t mouthX, mouthY, mouthR, mouthOpen;
-        bool operator!=(const DecorGeom &o) const;
+
+    struct EyeRender {
+        float    cx, cy, hw, hh, corner;
+        float    topLid, topTilt, botLid, bend, skewX, skewY;
+        float    hlX, hlY;          // secondary-motion highlight center
+        uint8_t  r, g, b;           // eye cyber phosphor color
+        bool     tear, heart;
+        int16_t  bx1, by1, bx2, by2; // integer bounding box on screen
     };
 
     lv_obj_t   *_obj = nullptr;
@@ -96,42 +116,51 @@ private:
     uint32_t    _wakeMs = 0;
     float       _drowsy = 0;
     uint16_t    _speechRms = 0, _listenRms = 0;
-    float       _speechEnv = 0, _listenEnv = 0;
+    float       _speechFast = 0, _speechSlow = 0, _listenEnv = 0;
     bool        _touch = false;
     int16_t     _touchX = 0, _touchY = 0;
-    uint8_t     _decor = DECOR_NONE;
+    uint8_t     _decor = DECOR_HIGHLIGHT | DECOR_BLUSH;
     bool        _auto = true;
 
     Spring _eye[2][P_COUNT];
     Spring _gazeX, _gazeY;
+    Spring _hlX, _hlY;              // highlight lags behind gaze (secondary motion)
+    Spring _colR, _colG, _colB;     // smooth phosphor color transitions
     Spring _blushOpa, _mouthOpen;
 
     float    _gazeTgtX = 0, _gazeTgtY = 0;
     uint32_t _nextGazeMs = 0;
     bool     _thinkLeft = false;
 
+    IdleClip _clip = CLIP_NONE;
+    uint32_t _clipStartMs = 0;
+    uint32_t _nextClipMs = 0;
+
     uint32_t _blinkStartMs = 0;
     uint16_t _blinkCloseMs = 0, _blinkOpenMs = 0;
     uint8_t  _blinkOffsetMs = 0;
+    float    _blinkDepth = 1.0f;    // 1.0 = full blink, 0.4 = saccadic half-blink
     bool     _blinkTwice = false;
     uint32_t _nextBlinkMs = 0;
 
-    EyeGeom   _geom[2]{};
-    DecorGeom _decorGeom{};
+    EyeRender _cur[2]{};
+    lv_area_t _prevEyeBox[2]{};
+    lv_area_t _prevDecorBox{};
+    bool      _hasPrevBox = false;
 
     static void _timerCb(lv_timer_t *t);
     static void _drawCb(lv_event_t *e);
-    static void _drawEye(lv_layer_t *layer, int eye, const EyeGeom &g);
 
-    void _tick();
-    void _targets(uint32_t now, Pose out[2]) const;
-    void _scheduleGaze(uint32_t now);
-    void _scheduleBlink(uint32_t now, bool soon);
+    void  _tick();
+    void  _targets(uint32_t now, Pose out[2], uint8_t rgb[3]) const;
+    void  _applyIdleClip(uint32_t now, Pose out[2], float &gx, float &gy);
+    void  _scheduleGaze(uint32_t now);
+    void  _scheduleBlink(uint32_t now, bool soon, float depth = 1.0f);
     float _blinkAmount(uint32_t now, int eye) const;
-    void _computeGeom(uint32_t now, EyeGeom out[2], DecorGeom &decor);
-    void _invalidate(const EyeGeom &g);
-    void _invalidateDecor(const DecorGeom &d);
-    void _draw(lv_layer_t *layer) const;
+    void  _buildRender(uint32_t now, EyeRender out[2]);
+    void  _draw(lv_layer_t *layer) const;
+    static void _rasterizeEye(lv_layer_t *layer, int eyeIdx, const EyeRender &e);
+    void  _rasterizeDecor(lv_layer_t *layer, uint32_t now) const;
 };
 
 extern CatFace catFace;
