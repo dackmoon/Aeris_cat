@@ -77,8 +77,14 @@ public:
     void setListenLevel(uint16_t rms);        // microphone level while listening
     void setTouch(bool pressed, int16_t x, int16_t y);
     void setDecor(uint8_t mask);
+    // Global colour softening applied to every face colour:
+    // saturation 0 = grey .. 1 = palette as designed; brightness scales the result.
+    void setPalette(float saturation, float brightness);
     // Tooling (simulator snapshots): disable random blinks, glances, and idle clips.
-    void setAutoBehaviours(bool on) { _auto = on; }
+    void setAutoBehaviours(bool on) {
+        _auto = on;
+        if (!on) _scheduleBlink(lv_tick_get(), false);   // drop any blink already queued
+    }
 
     CatActivity activity() const { return _activity; }
     CatMood     mood() const;                 // effective mood (pulse wins)
@@ -121,12 +127,27 @@ private:
     int16_t     _touchX = 0, _touchY = 0;
     uint8_t     _decor = DECOR_HIGHLIGHT | DECOR_BLUSH;
     bool        _auto = true;
+    float       _sat = 0.65f, _val = 0.85f;   // gentler than the raw neon palette
 
     Spring _eye[2][P_COUNT];
     Spring _gazeX, _gazeY;
     Spring _hlX, _hlY;              // highlight lags behind gaze (secondary motion)
     Spring _colR, _colG, _colB;     // smooth phosphor color transitions
     Spring _blushOpa, _mouthOpen;
+
+    // Listening: head-tilt side (+1 = toward the right eye) and the perked cat ears.
+    int8_t _listenSide = 1;
+    float  _listenSlow = 0;          // slow mic envelope; fast - slow = voice onset
+    Spring _earShow;
+    Spring _earFlick[2];
+    struct EarGeom {
+        float     outer[3][2], inner[3][2];
+        lv_area_t box;
+        bool      visible;
+    };
+    EarGeom _ears[2]{};
+    lv_area_t _prevEarBox[2]{};
+    bool   _prevEarVisible[2]{};
 
     float    _gazeTgtX = 0, _gazeTgtY = 0;
     uint32_t _nextGazeMs = 0;
@@ -161,6 +182,14 @@ private:
     void  _draw(lv_layer_t *layer) const;
     static void _rasterizeEye(lv_layer_t *layer, int eyeIdx, const EyeRender &e);
     void  _rasterizeDecor(lv_layer_t *layer, uint32_t now) const;
+    void  _soft(uint8_t r, uint8_t g, uint8_t b, uint8_t out[3]) const;
+    void  _rasterizeEars(lv_layer_t *layer) const;
+    void  _buildEars();
+    float _listenLevel(float env) const;      // 0..1, log scale of a mic envelope
 };
 
 extern CatFace catFace;
+
+// Diagnostics: time spent in ears / eyes / decor drawing (us), draw calls and
+// clip-area pixels since the previous call.
+void catFaceTakeProfile(uint32_t us[3], uint32_t *calls, uint32_t *px);

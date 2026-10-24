@@ -1,3 +1,7 @@
+// The per-pixel rasterizers below are float-heavy inner loops; the firmware's
+// default -Os leaves them un-inlined and spilling to memory.
+#pragma GCC optimize ("O2")
+
 #include "cat_face.h"
 #include <Arduino.h>
 #include <math.h>
@@ -10,6 +14,14 @@ static const float   EYE_X[2] = {110.0f, 250.0f};
 static const float   EYE_Y    = 136.0f;
 static const int16_t MOUTH_X  = 180;
 static const int16_t MOUTH_Y  = 208;
+// Listening cat ears: base centre sits above-outside each eye, inside the round screen.
+static const float   EAR_X      = 88.0f;    // horizontal offset of the ear base from screen centre
+static const float   EAR_Y      = 62.0f;
+static const float   EAR_HALF_W = 17.0f;    // core triangle; EAR_ROUND is added all around
+static const float   EAR_H      = 30.0f;
+static const float   EAR_ROUND  = 9.0f;
+static const float   EAR_SPLAY  = 0.26f;    // outward lean (rad)
+static const uint8_t EAR_INNER_RGB[3] = {0xFF, 0x9A, 0xC4};
 
 // Background RGB888 (#0a0a1a)
 static const uint8_t BG_R = 0x0a, BG_G = 0x0a, BG_B = 0x1a;
@@ -190,12 +202,17 @@ void CatFace::create(lv_obj_t *parent) {
 
     _colR.freq = _colG.freq = _colB.freq = 4.0f;
     _colR.damp = _colG.damp = _colB.damp = 0.90f;
-    _colR.snap(MOOD_RGB[MOOD_NEUTRAL][0]);
-    _colG.snap(MOOD_RGB[MOOD_NEUTRAL][1]);
-    _colB.snap(MOOD_RGB[MOOD_NEUTRAL][2]);
+    uint8_t c0[3];
+    _soft(MOOD_RGB[MOOD_NEUTRAL][0], MOOD_RGB[MOOD_NEUTRAL][1], MOOD_RGB[MOOD_NEUTRAL][2], c0);
+    _colR.snap(c0[0]);
+    _colG.snap(c0[1]);
+    _colB.snap(c0[2]);
 
     _blushOpa.freq = 3.0f;   _blushOpa.damp = 0.85f;
     _mouthOpen.freq = 15.0f; _mouthOpen.damp = 0.80f;
+    _earShow.freq = 4.5f;    _earShow.damp = 0.45f;   // perks up with a springy overshoot
+    _earFlick[0].freq = 9.0f;  _earFlick[0].damp = 0.35f;
+    _earFlick[1].freq = 10.5f; _earFlick[1].damp = 0.35f; // right ear flicks a beat later
 
     uint32_t now = lv_tick_get();
     _lastTickMs = now;
@@ -222,6 +239,7 @@ void CatFace::setActivity(CatActivity a) {
         _drowsy = 0;
         pulseMood(MOOD_SURPRISED, 420);
     }
+    if (a == ACT_LISTENING) _listenSide = random(0, 2) ? 1 : -1;
     if (a == ACT_LISTENING || a == ACT_THINKING) {
         _scheduleBlink(now, true, 0.55f);
     }
@@ -249,6 +267,13 @@ CatMood CatFace::mood() const {
     return _mood;
 }
 
+// Mic RMS: silence ≈ 5, soft speech 50–150, normal speech several hundred to ~3000.
+// Log scale so soft voices still move the face: 15 → 0, 150 → 0.5, 1500 → 1.
+float CatFace::_listenLevel(float env) const {
+    if (env <= 15.0f) return 0.0f;
+    return clampf(log10f(env / 15.0f) * 0.5f, 0.0f, 1.0f);
+}
+
 void CatFace::setDrowsiness(float d) { _drowsy = clampf(d, 0, 1); }
 void CatFace::setSpeechLevel(uint16_t rms) { _speechRms = rms; }
 void CatFace::setListenLevel(uint16_t rms) { _listenRms = rms; }
@@ -265,6 +290,22 @@ void CatFace::setDecor(uint8_t mask) {
     if (mask == _decor) return;
     _decor = mask;
     if (_obj) lv_obj_invalidate(_obj);
+}
+
+void CatFace::setPalette(float saturation, float brightness) {
+    saturation = clampf(saturation, 0.0f, 1.0f);
+    brightness = clampf(brightness, 0.2f, 1.0f);
+    if (saturation == _sat && brightness == _val) return;
+    _sat = saturation;
+    _val = brightness;
+    if (_obj) lv_obj_invalidate(_obj);
+}
+
+// Pull a palette colour toward its own luminance grey, then dim it.
+void CatFace::_soft(uint8_t r, uint8_t g, uint8_t b, uint8_t out[3]) const {
+    float y = 0.299f * r + 0.587f * g + 0.114f * b;
+    const float in[3] = {(float)r, (float)g, (float)b};
+    for (int i = 0; i < 3; i++) out[i] = (uint8_t)clampf((y + (in[i] - y) * _sat) * _val, 0.0f, 255.0f);
 }
 
 // ==========================================================
@@ -474,7 +515,7 @@ void CatFace::_targets(uint32_t now, Pose out[2], uint8_t rgb[3]) const {
     uint32_t inAct = now - _activitySinceMs;
 
     const uint8_t *pal = (_activity == ACT_SLEEPING) ? SLEEP_RGB : MOOD_RGB[m];
-    rgb[0] = pal[0]; rgb[1] = pal[1]; rgb[2] = pal[2];
+    _soft(pal[0], pal[1], pal[2], rgb);
 
     for (int i = 0; i < 2; i++) {
         Pose p = MOOD_POSE[m][i];
@@ -498,11 +539,17 @@ void CatFace::_targets(uint32_t now, Pose out[2], uint8_t rgb[3]) const {
 
         switch (_activity) {
         case ACT_LISTENING: {
-            float k = clampf(_listenEnv / 2200.0f, 0, 1);
-            float s = (inAct < 85) ? 0.86f : 1.06f + 0.08f * k;
+            float k = _listenLevel(_listenEnv);
+            // Anticipation squash for the first 85ms, then perk up and grow with the voice.
+            float s = (inAct < 85) ? 0.86f : 1.04f + 0.16f * k;
             p.h *= s;
-            p.w *= (inAct < 85) ? 1.08f : (1.04f + 0.05f * k);
-            p.dy -= 4.0f + 3.0f * k;
+            p.w *= (inAct < 85) ? 1.08f : (1.02f + 0.07f * k);
+            // Eyes sit a little lower to leave room for the ears; the ears do the perking up.
+            p.dy += 8.0f - 3.0f * k;
+            // Head tilt: the eye on the tilt side drops, the other rises, both lean that way.
+            float side = (float)_listenSide;
+            p.dy += (i == 1 ? side : -side) * 8.0f;
+            p.dx += 5.0f * side;
             p.topLid = 0.0f;
             break;
         }
@@ -581,7 +628,20 @@ void CatFace::_tick() {
     float spkIn = (_activity == ACT_TALKING) ? (float)_speechRms : 0.0f;
     follow(_speechFast, spkIn, 0.015f, 0.070f);
     follow(_speechSlow, spkIn, 0.120f, 0.220f);
-    follow(_listenEnv, (_activity == ACT_LISTENING) ? (float)_listenRms : 0.0f, 0.04f, 0.16f);
+    follow(_listenEnv, (_activity == ACT_LISTENING) ? (float)_listenRms : 0.0f, 0.03f, 0.16f);
+
+    // Ears: perk up while listening; each voice onset flicks them outward.
+    {
+        bool listening = _activity == ACT_LISTENING;
+        follow(_listenSlow, listening ? (float)_listenRms : 0.0f, 0.30f, 0.45f);
+        float onset = clampf((_listenLevel(_listenEnv) - _listenLevel(_listenSlow)) * 3.0f, 0.0f, 1.0f);
+        _earShow.target = listening ? 1.0f : 0.0f;
+        _earShow.step(dt);
+        for (int i = 0; i < 2; i++) {
+            _earFlick[i].target = onset;
+            _earFlick[i].step(dt);
+        }
+    }
 
     if ((int32_t)(now - _nextGazeMs) >= 0) _scheduleGaze(now);
     if ((int32_t)(now - _nextBlinkMs) >= 0) _scheduleBlink(now, false, 1.0f);
@@ -665,6 +725,22 @@ void CatFace::_tick() {
         _prevDecorBox.x1 = mouthVis ? 1 : 0;
     }
     _prevDecorBox.x2 = blushVis ? 1 : 0;
+
+    _buildEars();
+    for (int i = 0; i < 2; i++) {
+        const EarGeom &eg = _ears[i];
+        if (eg.visible && _prevEarVisible[i]) {
+            lv_area_t dirty;
+            unionArea(dirty, _prevEarBox[i], eg.box);
+            lv_obj_invalidate_area(_obj, &dirty);
+        } else if (eg.visible) {
+            lv_obj_invalidate_area(_obj, &eg.box);
+        } else if (_prevEarVisible[i]) {
+            lv_obj_invalidate_area(_obj, &_prevEarBox[i]);
+        }
+        _prevEarBox[i] = eg.box;
+        _prevEarVisible[i] = eg.visible;
+    }
     _hasPrevBox = true;
 }
 
@@ -820,8 +896,11 @@ void CatFace::_rasterizeEye(lv_layer_t *layer, int eyeIdx, const EyeRender &e) {
         lutRgb[c][2] = b;
     }
     const uint16_t solid565 = lut565[15];
-    const uint16_t heart565 = packRgb565(255, 232, 245);
-    const uint16_t white565 = packRgb565(255, 255, 255);
+    uint8_t heartRgb[3], whiteRgb[3];
+    catFace._soft(255, 232, 245, heartRgb);
+    catFace._soft(255, 255, 255, whiteRgb);
+    const uint16_t heart565 = packRgb565(heartRgb[0], heartRgb[1], heartRgb[2]);
+    const uint16_t white565 = packRgb565(whiteRgb[0], whiteRgb[1], whiteRgb[2]);
 
     // Dual cute round catchlights: a big one in upper-left + a small one in lower-right
     const float hl1X = e.hlX,                  hl1Y = e.hlY,                  hl1R = 11.0f;
@@ -945,7 +1024,7 @@ void CatFace::_rasterizeEye(lv_layer_t *layer, int eyeIdx, const EyeRender &e) {
                             uint8_t *row = db->data + (y - bufY1) * stride;
                             ((uint16_t *)row)[bx] = heart565;
                         } else {
-                            putPixel(layer, x, y, 255, 232, 245);
+                            putPixel(layer, x, y, heartRgb[0], heartRgb[1], heartRgb[2]);
                         }
                     }
                 }
@@ -962,7 +1041,7 @@ void CatFace::_rasterizeEye(lv_layer_t *layer, int eyeIdx, const EyeRender &e) {
                             uint8_t *row = db->data + (y - bufY1) * stride;
                             ((uint16_t *)row)[bx] = white565;
                         } else {
-                            putPixel(layer, x, y, 255, 255, 255);
+                            putPixel(layer, x, y, whiteRgb[0], whiteRgb[1], whiteRgb[2]);
                         }
                     }
                 };
@@ -984,7 +1063,7 @@ void CatFace::_rasterizeEye(lv_layer_t *layer, int eyeIdx, const EyeRender &e) {
                             uint8_t *row = db->data + (y - bufY1) * stride;
                             ((uint16_t *)row)[bx] = white565;
                         } else {
-                            putPixel(layer, x, y, 255, 255, 255);
+                            putPixel(layer, x, y, whiteRgb[0], whiteRgb[1], whiteRgb[2]);
                         }
                     }
                 }
@@ -1000,6 +1079,9 @@ void CatFace::_rasterizeDecor(lv_layer_t *layer, uint32_t now) const {
 
     float avgDx = ((_cur[0].cx - EYE_X[0]) + (_cur[1].cx - EYE_X[1])) * 0.4f;
     float avgDy = ((_cur[0].cy - EYE_Y)    + (_cur[1].cy - EYE_Y))    * 0.4f;
+    uint8_t blush[3], tongue[3];
+    _soft(0xFF, 0x64, 0xA6, blush);
+    _soft(0xFF, 0x62, 0x98, tongue);
 
     // 1. Soft, seamless rosy oval blush under each eye (zero stripes!)
     float bOpa = clampf(_blushOpa.x / 255.0f, 0.0f, 1.0f);
@@ -1024,9 +1106,9 @@ void CatFace::_rasterizeDecor(lv_layer_t *layer, uint32_t now) const {
                     if (env <= 0) continue;
                     // Smooth quadratic falloff so the blush is a soft glowing cloud
                     float a = (float)(env * env) * scale;
-                    uint8_t r = (uint8_t)(BG_R + (0xFF - BG_R) * a);
-                    uint8_t g = (uint8_t)(BG_G + (0x64 - BG_G) * a);
-                    uint8_t b = (uint8_t)(BG_B + (0xA6 - BG_B) * a);
+                    uint8_t r = (uint8_t)(BG_R + (blush[0] - BG_R) * a);
+                    uint8_t g = (uint8_t)(BG_G + (blush[1] - BG_G) * a);
+                    uint8_t b = (uint8_t)(BG_B + (blush[2] - BG_B) * a);
                     putPixel(layer, x, y, r, g, b);
                 }
             }
@@ -1059,7 +1141,180 @@ void CatFace::_rasterizeDecor(lv_layer_t *layer, uint32_t now) const {
                     uint8_t b = (uint8_t)(BG_B + (mb - BG_B) * a);
                     putPixel(layer, x, y, r, g, b);
                 } else if (open > 1.5f && fabsf(dx) < 7.0f && y > wCurve && y < wCurve + open * (1.0f - (dx * dx) / 49.0f)) {
-                    putPixel(layer, x, y, 0xFF, 0x62, 0x98);
+                    putPixel(layer, x, y, tongue[0], tongue[1], tongue[2]);
+                }
+            }
+        }
+    }
+}
+
+// Triangle prepared once per frame for per-pixel signed-distance queries.
+struct EarTri {
+    float vx[3], vy[3];          // vertices
+    float ex[3], ey[3], il2[3];  // edge i: v[i] -> v[i+1], 1/|e|^2
+    float nx[3], ny[3], c[3];    // outward unit normal and offset of each edge line
+};
+
+static void prepTri(EarTri &t, const float v[3][2]) {
+    float gx = (v[0][0] + v[1][0] + v[2][0]) / 3.0f, gy = (v[0][1] + v[1][1] + v[2][1]) / 3.0f;
+    for (int i = 0; i < 3; i++) {
+        int j = (i + 1) % 3;
+        t.vx[i] = v[i][0]; t.vy[i] = v[i][1];
+        t.ex[i] = v[j][0] - v[i][0]; t.ey[i] = v[j][1] - v[i][1];
+        float l2 = t.ex[i] * t.ex[i] + t.ey[i] * t.ey[i];
+        t.il2[i] = 1.0f / l2;
+        float il = 1.0f / sqrtf(l2);
+        float nx = t.ey[i] * il, ny = -t.ex[i] * il;
+        float c = nx * v[i][0] + ny * v[i][1];
+        if (nx * gx + ny * gy - c > 0) { nx = -nx; ny = -ny; c = -c; }
+        t.nx[i] = nx; t.ny[i] = ny; t.c[i] = c;
+    }
+}
+
+// Signed distance to the triangle (negative inside). `pl` holds the three
+// edge-line distances at (px, py), maintained incrementally by the caller.
+// Their maximum is exact inside and a lower bound outside, so far pixels exit
+// before any sqrt. With one positive line the nearest boundary point is on that
+// edge if the projection lands inside the segment, else the segment's end vertex;
+// only corner regions (two lines positive) need the full segment search.
+static inline __attribute__((always_inline))
+float sdTri(const EarTri &t, const float pl[3], float px, float py, float band) {
+    float a = pl[0], b = pl[1], c = pl[2];
+    float m = a > b ? a : b;
+    m = m > c ? m : c;
+    if (m <= 0.0f || m > band) return m;
+    int pos = (a > 0.0f) + (b > 0.0f) + (c > 0.0f);
+    if (pos == 1) {
+        int i = a > 0.0f ? 0 : (b > 0.0f ? 1 : 2);
+        float wx = px - t.vx[i], wy = py - t.vy[i];
+        float s = (wx * t.ex[i] + wy * t.ey[i]) * t.il2[i];
+        if (s >= 0.0f && s <= 1.0f) return m;
+        if (s > 1.0f) { wx -= t.ex[i]; wy -= t.ey[i]; }
+        return sqrtf(wx * wx + wy * wy);
+    }
+    float d2 = 1e9f;
+    for (int i = 0; i < 3; i++) {
+        float wx = px - t.vx[i], wy = py - t.vy[i];
+        float s = clampf((wx * t.ex[i] + wy * t.ey[i]) * t.il2[i], 0.0f, 1.0f);
+        float bx = wx - t.ex[i] * s, by = wy - t.ey[i] * s;
+        float q = bx * bx + by * by;
+        if (q < d2) d2 = q;
+    }
+    return sqrtf(d2);
+}
+
+// x-range of row `fy` where the triangle grown by `grow` px can be present.
+static bool triRowSpan(const EarTri &t, float fy, float grow, float &lo, float &hi) {
+    lo = -1e9f; hi = 1e9f;
+    for (int i = 0; i < 3; i++) {
+        float k = grow + t.c[i] - t.ny[i] * fy;   // need nx * x <= k
+        if (t.nx[i] > 1e-4f)       { float v = k / t.nx[i]; if (v < hi) hi = v; }
+        else if (t.nx[i] < -1e-4f) { float v = k / t.nx[i]; if (v > lo) lo = v; }
+        else if (k < 0.0f)         return false;
+    }
+    return lo <= hi;
+}
+
+void CatFace::_buildEars() {
+    float show = clampf(_earShow.x, 0.0f, 1.3f);
+    float k = _listenLevel(_listenEnv);
+    float side = (float)_listenSide;
+
+    for (int i = 0; i < 2; i++) {
+        EarGeom &eg = _ears[i];
+        eg.visible = show >= 0.02f;
+        if (!eg.visible) continue;
+        float out = i == 0 ? -1.0f : 1.0f;
+        float flick = clampf(_earFlick[i].x, -0.5f, 1.5f);
+        // Ears ride along with the eye below them (head tilt, perk-up, gaze).
+        float bx = 180.0f + out * EAR_X + (_cur[i].cx - EYE_X[i]) * 0.8f;
+        float by = EAR_Y + (_cur[i].cy - EYE_Y) * 0.8f + (1.0f - fminf(show, 1.0f)) * 10.0f;
+        float h = EAR_H * show * (1.0f + 0.15f * k + 0.20f * flick);
+        float ang = out * (EAR_SPLAY + 0.25f * flick) + side * 0.05f;
+        float ux = sinf(ang), uy = -cosf(ang);      // ear axis, pointing up
+        float nx = -uy, ny = ux;                     // across the base
+
+        float (*o)[2] = eg.outer;
+        o[0][0] = bx - nx * EAR_HALF_W; o[0][1] = by - ny * EAR_HALF_W;
+        o[1][0] = bx + nx * EAR_HALF_W; o[1][1] = by + ny * EAR_HALF_W;
+        o[2][0] = bx + ux * h;          o[2][1] = by + uy * h;
+        float ibx = bx + ux * 4.0f, iby = by + uy * 4.0f, ih = h * 0.62f, ihw = EAR_HALF_W * 0.45f;
+        float (*n)[2] = eg.inner;
+        n[0][0] = ibx - nx * ihw; n[0][1] = iby - ny * ihw;
+        n[1][0] = ibx + nx * ihw; n[1][1] = iby + ny * ihw;
+        n[2][0] = ibx + ux * ih;  n[2][1] = iby + uy * ih;
+
+        const float pad = EAR_ROUND + 2.0f;
+        eg.box.x1 = (int32_t)floorf(fminf(fminf(o[0][0], o[1][0]), o[2][0]) - pad);
+        eg.box.x2 = (int32_t)ceilf(fmaxf(fmaxf(o[0][0], o[1][0]), o[2][0]) + pad);
+        eg.box.y1 = (int32_t)floorf(fminf(fminf(o[0][1], o[1][1]), o[2][1]) - pad);
+        eg.box.y2 = (int32_t)ceilf(fmaxf(fmaxf(o[0][1], o[1][1]), o[2][1]) + pad);
+    }
+}
+
+void CatFace::_rasterizeEars(lv_layer_t *layer) const {
+    if (!layer || !layer->draw_buf) return;
+    uint8_t cr = _cur[0].r, cg = _cur[0].g, cb = _cur[0].b;
+
+    for (int i = 0; i < 2; i++) {
+        const EarGeom &eg = _ears[i];
+        if (!eg.visible) continue;
+        int32_t x1 = LV_MAX(layer->_clip_area.x1, eg.box.x1);
+        int32_t x2 = LV_MIN(layer->_clip_area.x2, eg.box.x2);
+        int32_t y1 = LV_MAX(layer->_clip_area.y1, eg.box.y1);
+        int32_t y2 = LV_MIN(layer->_clip_area.y2, eg.box.y2);
+        if (x1 > x2 || y1 > y2) continue;
+
+        EarTri to, ti;
+        prepTri(to, eg.outer);
+        prepTri(ti, eg.inner);
+        const float INNER_ROUND = 3.0f;
+        uint8_t ein[3];
+        _soft(EAR_INNER_RGB[0], EAR_INNER_RGB[1], EAR_INNER_RGB[2], ein);
+        const float pr = cr + (ein[0] - cr) * 0.9f;
+        const float pg = cg + (ein[1] - cg) * 0.9f;
+        const float pb = cb + (ein[2] - cb) * 0.9f;
+        const bool is565 = layer->color_format == LV_COLOR_FORMAT_RGB565;
+        const uint16_t outer565 = packRgb565(cr, cg, cb);
+        const uint16_t inner565 = packRgb565((uint8_t)pr, (uint8_t)pg, (uint8_t)pb);
+        lv_draw_buf_t *db = layer->draw_buf;
+
+        auto blend = [&](int32_t x, int32_t y, float t, float cov) {
+            float r = cr + (pr - cr) * t, g = cg + (pg - cg) * t, b = cb + (pb - cb) * t;
+            putPixel(layer, x, y,
+                     (uint8_t)(BG_R + (r - BG_R) * cov),
+                     (uint8_t)(BG_G + (g - BG_G) * cov),
+                     (uint8_t)(BG_B + (b - BG_B) * cov));
+        };
+
+        for (int32_t y = y1; y <= y2; y++) {
+            float fy = (float)y;
+            float lo, hi;
+            if (!triRowSpan(to, fy, EAR_ROUND + 1.0f, lo, hi)) continue;
+            int32_t xa = LV_MAX(x1, (int32_t)floorf(lo));
+            int32_t xb = LV_MIN(x2, (int32_t)ceilf(hi));
+            uint16_t *row = (uint16_t *)(db->data + (y - layer->buf_area.y1) * db->header.stride)
+                            - layer->buf_area.x1;
+            float po[3], pi[3];
+            for (int e = 0; e < 3; e++) {
+                po[e] = to.nx[e] * xa + to.ny[e] * fy - to.c[e];
+                pi[e] = ti.nx[e] * xa + ti.ny[e] * fy - ti.c[e];
+            }
+            for (int32_t x = xa; x <= xb; x++, po[0] += to.nx[0], po[1] += to.nx[1], po[2] += to.nx[2],
+                                               pi[0] += ti.nx[0], pi[1] += ti.nx[1], pi[2] += ti.nx[2]) {
+                float d = sdTri(to, po, (float)x, fy, EAR_ROUND + 1.0f) - EAR_ROUND;
+                if (d >= 0.5f) continue;
+                float cov = d <= -0.5f ? 1.0f : 0.5f - d;
+                // Inner ear: soft pink, only where the outer ear is solid enough to show it.
+                float t = 0.0f;
+                if (d < -1.0f) {
+                    float di = sdTri(ti, pi, (float)x, fy, INNER_ROUND + 1.0f) - INNER_ROUND;
+                    t = di <= -0.5f ? 1.0f : (di >= 0.5f ? 0.0f : 0.5f - di);
+                }
+                if (is565 && cov >= 1.0f && (t == 0.0f || t == 1.0f)) {
+                    row[x] = t == 0.0f ? outer565 : inner565;
+                } else {
+                    blend(x, y, t, cov);
                 }
             }
         }
@@ -1071,9 +1326,28 @@ void CatFace::_drawCb(lv_event_t *e) {
     self->_draw(lv_event_get_layer(e));
 }
 
+static uint32_t s_profUs[3], s_profCalls, s_profPx;
+
+void catFaceTakeProfile(uint32_t us[3], uint32_t *calls, uint32_t *px) {
+    for (int i = 0; i < 3; i++) { us[i] = s_profUs[i]; s_profUs[i] = 0; }
+    *calls = s_profCalls; s_profCalls = 0;
+    *px = s_profPx; s_profPx = 0;
+}
+
 void CatFace::_draw(lv_layer_t *layer) const {
+    const lv_area_t &c = layer->_clip_area;
+    s_profCalls++;
+    s_profPx += (uint32_t)((c.x2 - c.x1 + 1) * (c.y2 - c.y1 + 1));
+    uint32_t t0 = micros();
+    _rasterizeEars(layer);
+    uint32_t t1 = micros();
     for (int i = 0; i < 2; i++) {
         _rasterizeEye(layer, i, _cur[i]);
     }
+    uint32_t t2 = micros();
     _rasterizeDecor(layer, lv_tick_get());
+    uint32_t t3 = micros();
+    s_profUs[0] += t1 - t0;
+    s_profUs[1] += t2 - t1;
+    s_profUs[2] += t3 - t2;
 }

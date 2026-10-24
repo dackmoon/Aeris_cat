@@ -178,6 +178,11 @@ static const Shot DECOR_SHOTS[] = {
     {ACT_TALKING,   MOOD_HAPPY,   3200},
 };
 
+static const Shot LISTEN_SHOTS[] = {
+    {ACT_IDLE, MOOD_NEUTRAL, 0}, {ACT_LISTENING, MOOD_NEUTRAL, 0},
+    {ACT_LISTENING, MOOD_NEUTRAL, 900}, {ACT_LISTENING, MOOD_NEUTRAL, 2600},
+};
+
 static void applyShot(const Shot &s) {
     catFace.setActivity(s.act);
     catFace.setMood(s.mood);
@@ -214,14 +219,44 @@ static int renderGrid(const char *path, const Shot *shots, int n, int cols,
     return 0;
 }
 
+static const Shot PALETTE_SHOTS[] = {
+    {ACT_IDLE, MOOD_NEUTRAL, 0}, {ACT_IDLE, MOOD_HAPPY, 0}, {ACT_IDLE, MOOD_LOVE, 0},
+    {ACT_IDLE, MOOD_SAD, 0},     {ACT_IDLE, MOOD_ANGRY, 0}, {ACT_LISTENING, MOOD_NEUTRAL, 900},
+};
+static const float PALETTES[][2] = {{1.00f, 1.00f}, {0.65f, 0.85f}, {0.45f, 0.72f}};
+
+// One row per palette (saturation, brightness), same faces in every row.
+static int renderPaletteGrid(const char *path) {
+    const int GAP = 6, cols = 6, rows = 3;
+    int gw = cols * DISP_W + (cols - 1) * GAP;
+    int gh = rows * DISP_H + (rows - 1) * GAP;
+    uint8_t *grid = (uint8_t *)malloc((size_t)gw * gh * 3);
+    memset(grid, 0x22, (size_t)gw * gh * 3);
+    for (int r = 0; r < rows; r++) {
+        catFace.setPalette(PALETTES[r][0], PALETTES[r][1]);
+        for (int i = 0; i < cols; i++) {
+            applyShot(PALETTE_SHOTS[i]);
+            if (!blitScreen(grid, gw, i * (DISP_W + GAP), r * (DISP_H + GAP))) return 1;
+        }
+    }
+    savePpm(path, grid, gw, gh);
+    printf("saved %s\n", path);
+    free(grid);
+    return 0;
+}
+
 int main(int argc, char **argv) {
-    const char *shotsDir = nullptr, *decorDir = nullptr;
+    const char *shotsDir = nullptr, *decorDir = nullptr, *listenDir = nullptr, *paletteDir = nullptr;
     uint8_t shotDecor = DECOR_HIGHLIGHT | DECOR_BLUSH;
     if (argc >= 3 && strcmp(argv[1], "--shots") == 0) {
         shotsDir = argv[2];
         if (argc >= 4) shotDecor = (uint8_t)atoi(argv[3]);
     } else if (argc >= 3 && strcmp(argv[1], "--decor-shots") == 0) {
         decorDir = argv[2];
+    } else if (argc >= 3 && strcmp(argv[1], "--listen-shots") == 0) {
+        listenDir = argv[2];
+    } else if (argc >= 3 && strcmp(argv[1], "--palette-shots") == 0) {
+        paletteDir = argv[2];
     }
 
     lv_init();
@@ -243,6 +278,16 @@ int main(int argc, char **argv) {
         catFace.setDecor(shotDecor);
         snprintf(path, sizeof(path), "%s/grid.ppm", shotsDir);
         return renderGrid(path, STATE_SHOTS, 12, 4, nullptr, 3);
+    }
+    if (paletteDir) {
+        catFace.setAutoBehaviours(false);
+        snprintf(path, sizeof(path), "%s/palette.ppm", paletteDir);
+        return renderPaletteGrid(path);
+    }
+    if (listenDir) {
+        catFace.setAutoBehaviours(false);
+        snprintf(path, sizeof(path), "%s/listen.ppm", listenDir);
+        return renderGrid(path, LISTEN_SHOTS, 4, 4, nullptr, 1);
     }
     if (decorDir) {
         catFace.setAutoBehaviours(false);

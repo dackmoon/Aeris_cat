@@ -350,7 +350,7 @@ void LCD_addWindow(uint16_t Xstart, uint16_t Ystart, uint16_t Xend, uint16_t Yen
   }
 }
 
-uint8_t LCD_Backlight = 50;
+uint8_t LCD_Backlight = 35;
 
 void Backlight_Init()
 {

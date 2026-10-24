@@ -30,6 +30,12 @@ sips -s format png /tmp/catshots/grid.ppm --out grid.png
 
 # 装饰层对比：高光+腮红 / 无 / 仅高光 / 全部，各 5 种状态 → decor.ppm
 ./build/Release/lvgl_sim --decor-shots /tmp/catshots
+
+# 倾听（录音中）：待机 / 未说话 / 小声 / 大声 → listen.ppm
+./build/Release/lvgl_sim --listen-shots /tmp/catshots
+
+# 配色柔化三档对比（原始 / 默认 65%·85% / 45%·72%）→ palette.ppm
+./build/Release/lvgl_sim --palette-shots /tmp/catshots
 ```
 
 ---

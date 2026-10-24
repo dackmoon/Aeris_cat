@@ -47,6 +47,9 @@ uint32_t lvgl_take_render_max_ms(void) {
 
 static volatile bool    _touchPressed = false;
 static volatile int16_t _touchX = 0, _touchY = 0;
+static volatile bool    _touchAlwaysPoll = false;
+
+void lvgl_set_touch_always_poll(bool on) { _touchAlwaysPoll = on; }
 
 bool lvgl_touch_pressed(int16_t *x, int16_t *y) {
   if (x) *x = _touchX;
@@ -74,7 +77,7 @@ static void my_touchpad_read(lv_indev_t *indev_drv, lv_indev_data_t *data)
 {
   // Only perform an I2C read when CST816 signals an interrupt or a finger is
   // currently held down. Avoids a blocking I2C transaction on every idle frame.
-  if (Touch_interrupts || _touchPressed || digitalRead(CST816_INT_PIN) == LOW) {
+  if (_touchAlwaysPoll || Touch_interrupts || _touchPressed || digitalRead(CST816_INT_PIN) == LOW) {
     Touch_interrupts = 0;
     Touch_Read_Data();
     if (touch_data.points != 0x00) {

@@ -7,6 +7,7 @@
 
 // millis() — map to LVGL tick (same unit: ms since boot)
 static inline uint32_t millis() { return lv_tick_get(); }
+static inline uint32_t micros() { return lv_tick_get() * 1000u; }
 
 // random(lo, hi) — returns value in [lo, hi)
 static inline int32_t random(int32_t lo, int32_t hi) {

@@ -23,6 +23,9 @@
 #define SLEEP_AFTER_MS       120000UL   // fall asleep
 #define THINKING_TIMEOUT_MS   20000UL
 #define LONG_PRESS_MS           600UL
+#define DRAG_THRESHOLD_PX         20     // finger travel that turns a press into a drag
+#define PET_WINDOW_MS          3500UL   // taps closer than this count as one petting streak
+#define SULK_MS                1800UL
 #define STRESS_GAP_MS          1500UL
 
 // ============================================================
@@ -68,6 +71,8 @@ static std::atomic<int>      _reqActivity{ACT_IDLE};
 static std::atomic<int>      _reqMood{MOOD_NEUTRAL};
 static std::atomic<int>      _reqDrowsy{0};          // 0..1000
 static std::atomic<int>      _reqDecor{DECOR_HIGHLIGHT | DECOR_BLUSH};
+static std::atomic<int>      _reqSat{65};             // palette saturation, percent
+static std::atomic<int>      _reqVal{85};             // palette brightness, percent
 static std::atomic<int>      _reqPulseMood{MOOD_NEUTRAL};
 static std::atomic<uint32_t> _reqPulseMs{0};
 static std::atomic<bool>     _reqPulse{false};
@@ -93,6 +98,7 @@ static uint32_t           _tickerClearMs = 0;
 static std::atomic<bool>     _gTap{false};
 static std::atomic<bool>     _gLong{false};
 static std::atomic<uint32_t> _gTouchMs{0};
+static std::atomic<uint32_t> _gHeldMs{0};
 
 // ============================================================
 //  Globals
@@ -222,25 +228,34 @@ static void wake() {
 // ============================================================
 static uint32_t _lastPetMs       = 0;
 static uint8_t  _petStreak       = 0;
+static bool     _angry           = false;
 static uint32_t _lastInterruptMs = 0;
 
 static void onTap() {
     uint32_t now = millis();
     switch (dialogState) {
     case DIALOG_IDLE:
-        if (now - _lastPetMs < 3500) _petStreak++;
+        if (now - _lastPetMs < PET_WINDOW_MS) _petStreak++;
         else                         _petStreak = 1;
         _lastPetMs = now;
 
-        if (_petStreak >= 5) {
-            // Poked too many times in a row -> tsundere angry!
-            facePulse(MOOD_ANGRY, 2200);
-            _petStreak = 0;
-        } else if (_petStreak >= 2) {
-            // Multiple gentle pets -> affectionate Love!
-            facePulse(MOOD_LOVE, 2800);
-        } else {
-            facePulse((random(0, 100) < 30) ? MOOD_WINK : MOOD_HAPPY, 2200);
+        {
+            CatMood m;
+            uint32_t ms = 2200;
+            if (_petStreak >= 5) {
+                // Poked too many times in a row: stays angry while the poking goes on;
+                // loop() turns it into a short sulk once the poking stops.
+                m = MOOD_ANGRY;
+                ms = PET_WINDOW_MS + 500;
+                _angry = true;
+            } else if (_petStreak >= 2) {
+                m = MOOD_LOVE;
+                ms = 2800;
+            } else {
+                m = (random(0, 100) < 30) ? MOOD_WINK : MOOD_HAPPY;
+            }
+            Serial.printf("[Touch] pet streak %u -> %s\n", (unsigned)_petStreak, catMoodName(m));
+            facePulse(m, ms);
         }
         break;
     case DIALOG_SLEEPING:  wake(); break;
@@ -290,17 +305,36 @@ static void onLongPress() {
 //  LVGL update callback — Core 0, inside the LVGL lock, before
 //  lv_timer_handler(). The only place CatFace / LVGL is touched.
 // ============================================================
-static void detectGestures(bool pressed) {
-    static bool     down = false, longFired = false;
-    static uint32_t downMs = 0;
+// Gestures are classified on release: a slow drag looks exactly like a long
+// press for its first few hundred ms, so only the whole press can tell them
+// apart. Drags only steer the eyes (CatFace::setTouch).
+static void detectGestures(bool pressed, int16_t x, int16_t y) {
+    static bool     down = false;
+    static uint32_t downMs = 0, upMs = 0;
+    static int16_t  downX = 0, downY = 0;
+    static int32_t  maxMove = 0;
     uint32_t now = millis();
     if (pressed) {
         _gTouchMs = now;
-        if (!down) { down = true; longFired = false; downMs = now; }
-        else if (!longFired && now - downMs >= LONG_PRESS_MS) { longFired = true; _gLong = true; }
+        if (!down) {
+            down = true; downMs = now;
+            downX = x; downY = y; maxMove = 0;
+            Serial.printf("[Touch] raw down (%d,%d) gap=%ums\n", x, y, (unsigned)(now - upMs));
+        } else {
+            int32_t m = abs(x - downX) + abs(y - downY);
+            if (m > maxMove) maxMove = m;
+        }
     } else if (down) {
         down = false;
-        if (!longFired) _gTap = true;
+        upMs = now;
+        uint32_t held = now - downMs;
+        _gHeldMs = held;
+        bool drag = maxMove > DRAG_THRESHOLD_PX;
+        Serial.printf("[Touch] raw up held=%ums move=%dpx%s\n", (unsigned)held, (int)maxMove,
+                      drag ? " (drag)" : "");
+        if (drag)                       return;
+        if (held >= LONG_PRESS_MS)      _gLong = true;
+        else                            _gTap = true;
     }
 }
 
@@ -309,6 +343,7 @@ static void lvglUpdateCb() {
     catFace.setMood((CatMood)_reqMood.load());
     catFace.setDrowsiness(_reqDrowsy.load() / 1000.0f);
     catFace.setDecor((uint8_t)_reqDecor.load());
+    catFace.setPalette(_reqSat.load() / 100.0f, _reqVal.load() / 100.0f);
     if (_reqPulse.exchange(false)) catFace.pulseMood((CatMood)_reqPulseMood.load(), _reqPulseMs.load());
 
     catFace.setSpeechLevel(es8311GetPlayLevel());
@@ -317,7 +352,7 @@ static void lvglUpdateCb() {
     int16_t tx = 0, ty = 0;
     bool pressed = lvgl_touch_pressed(&tx, &ty);
     catFace.setTouch(pressed, tx, ty);
-    detectGestures(pressed);
+    detectGestures(pressed, tx, ty);
 
     if (_tickerClearNow.exchange(false) || (_tickerClearMs != 0 && millis() >= _tickerClearMs)) {
         _tickerClearMs = 0;
@@ -442,7 +477,7 @@ static void pollSerialCommands() {
         line[len] = '\0';
         len = 0;
 
-        int n;
+        int n, m;
         bool idle = dialogState == DIALOG_IDLE || dialogState == DIALOG_SLEEPING;
         if (sscanf(line, "act %d", &n) == 1 && n >= 0 && n < ACT_COUNT) {
             faceActivity((CatActivity)n);
@@ -467,6 +502,16 @@ static void pollSerialCommands() {
             } else {
                 Serial.println("[Cmd] busy, chat ignored");
             }
+        } else if (sscanf(line, "palette %d %d", &n, &m) == 2) {
+            _reqSat = n;
+            _reqVal = m;
+            Serial.printf("[Cmd] palette -> saturation %d%% brightness %d%%\n", n, m);
+        } else if (sscanf(line, "bl %d", &n) == 1 && n >= 0 && n <= 100) {
+            Set_Backlight((uint8_t)n);
+            Serial.printf("[Cmd] backlight -> %d%%\n", n);
+        } else if (sscanf(line, "touchpoll %d", &n) == 1) {
+            lvgl_set_touch_always_poll(n != 0);
+            Serial.printf("[Cmd] touchpoll -> %d\n", n != 0);
         } else if (strcmp(line, "tap") == 0) {
             _gTap = true;
         } else if (strcmp(line, "hold") == 0) {
@@ -496,8 +541,22 @@ void loop() {
         _lastInteractMs = touchMs;
         if (dialogState == DIALOG_IDLE) faceDrowsy(0);
     }
-    if (_gLong.exchange(false)) onLongPress();
-    if (_gTap.exchange(false))  onTap();
+    if (_gLong.exchange(false)) {
+        Serial.printf("[Touch] long press in %s\n", dialogName(dialogState));
+        onLongPress();
+    }
+    if (_gTap.exchange(false)) {
+        Serial.printf("[Touch] tap (%ums) in %s\n", (unsigned)_gHeldMs.load(), dialogName(dialogState));
+        onTap();
+    }
+    if (_angry && (dialogState != DIALOG_IDLE || millis() - _lastPetMs >= PET_WINDOW_MS)) {
+        _angry = false;
+        _petStreak = 0;
+        if (dialogState == DIALOG_IDLE) {
+            Serial.println("[Touch] poking stopped -> sulk");
+            facePulse(MOOD_SAD, SULK_MS);
+        }
+    }
 
     // ---- Idle: drowsiness → sleep ----
     if (dialogState == DIALOG_IDLE) {
@@ -613,6 +672,13 @@ void loop() {
                       dialogName(dialogState), (int)wifiConnected(),
                       fps, (unsigned)lvgl_take_render_max_ms(),
                       catActivityName(catFace.activity()), catMoodName(catFace.mood()));
+        uint32_t us[3], calls, px;
+        catFaceTakeProfile(us, &calls, &px);
+        float nf = fps * elapsed / 1000.0f;
+        if (nf < 1.0f) nf = 1.0f;
+        Serial.printf("[Prof] per frame: ears=%.2fms eyes=%.2fms decor=%.2fms draws=%.1f px=%u\n",
+                      us[0] / 1000.0f / nf, us[1] / 1000.0f / nf, us[2] / 1000.0f / nf,
+                      calls / nf, (unsigned)(px / nf));
     }
 
     delay(10);
